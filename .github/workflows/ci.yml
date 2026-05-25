@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cd shared && pip install -e .
+      - run: cd server && pip install -e ".[dev]"
+      - run: cd server && ruff check src tests
+      - run: cd server && pytest -q
+
+  worker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: cd shared && pip install -e .
+      - run: cd server && pip install -e .
+      - run: cd worker && pip install -e ".[dev]"
+      - run: cd worker && ruff check src tests
+      - run: cd worker && pytest -q
+
+  plugin:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build

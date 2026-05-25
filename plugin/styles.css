@@ -1,0 +1,11 @@
+/* Pitch — minimal styles. */
+.pitch-modal-input {
+  width: 100%;
+  margin-bottom: 0.5rem;
+}
+.pitch-progress {
+  margin-top: 0.75rem;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}

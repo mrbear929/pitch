@@ -1,0 +1,10 @@
+{
+  "id": "pitch",
+  "name": "Pitch",
+  "version": "0.1.0",
+  "minAppVersion": "1.5.0",
+  "description": "Send a video URL, get back a digestible note with timestamps, code snippets, and OCR'd frames.",
+  "author": "mrbear929",
+  "authorUrl": "https://github.com/mrbear929/pitch",
+  "isDesktopOnly": true
+}

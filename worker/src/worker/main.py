@@ -1,0 +1,116 @@
+"""Worker entrypoint. Long-polls dispatcher; processes one job at a time."""
+from __future__ import annotations
+
+import asyncio
+import logging
+import shutil
+import sys
+import traceback
+from pathlib import Path
+
+from pitch_shared import JobResult, JobStatus
+
+from .config import Config
+from .dispatcher_client import DispatcherClient
+from .pipeline import FetchError, Pipeline
+from .tools import make_default_pipeline
+
+log = logging.getLogger("pitch.worker")
+
+
+async def process_one(client: DispatcherClient, pipeline: Pipeline, config: Config) -> bool:
+    """Returns True if a job was processed (whether success or fail)."""
+    job = await client.claim_next()
+    if job is None:
+        return False
+
+    job_dir = config.work_dir / job.id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    log.info("processing job=%s url=%s", job.id, job.url)
+
+    try:
+        await client.post_progress(job.id, JobStatus.fetching, "downloading")
+        # The pipeline runs synchronously; we offload to a thread so we don't block the loop.
+        markdown, title, slug = await asyncio.to_thread(
+            _run_pipeline_with_progress,
+            pipeline,
+            job.url or "",
+            job_dir,
+            config.frame_every_seconds,
+            client,
+            job.id,
+        )
+        await client.post_result(
+            job.id,
+            JobResult(
+                status=JobStatus.done,
+                markdown=markdown,
+                title=title,
+                slug=slug,
+            ),
+        )
+        log.info("done job=%s", job.id)
+    except FetchError as e:
+        log.warning("fetch_failed job=%s err=%s", job.id, e)
+        await client.post_result(
+            job.id,
+            JobResult(
+                status=JobStatus.failed,
+                error=str(e),
+                user_guidance=e.user_guidance,
+            ),
+        )
+    except Exception as e:
+        log.error("worker error job=%s\n%s", job.id, traceback.format_exc())
+        await client.post_result(
+            job.id,
+            JobResult(
+                status=JobStatus.failed,
+                error=str(e),
+                user_guidance="Worker error. Check the worker log on the Mac.",
+            ),
+        )
+    finally:
+        # Clean up job working files; keep dispatcher result.
+        shutil.rmtree(job_dir, ignore_errors=True)
+    return True
+
+
+def _run_pipeline_with_progress(
+    pipeline: Pipeline,
+    url: str,
+    job_dir: Path,
+    frame_every_seconds: int,
+    client: DispatcherClient,
+    job_id: str,
+) -> tuple[str, str, str]:
+    """Sync wrapper that owns the heavy lifting. Progress pings are best-effort."""
+    return pipeline.run(url=url, work_dir=job_dir, frame_every_seconds=frame_every_seconds)
+
+
+async def run_forever(config: Config) -> None:
+    client = DispatcherClient(config.dispatcher_url, config.worker_token)
+    pipeline = make_default_pipeline(config)
+    log.info("worker started; dispatcher=%s work_dir=%s", config.dispatcher_url, config.work_dir)
+    while True:
+        try:
+            had_work = await process_one(client, pipeline, config)
+        except Exception:
+            log.exception("loop error; sleeping before retry")
+            await asyncio.sleep(config.poll_idle_seconds)
+            continue
+        if not had_work:
+            await asyncio.sleep(config.poll_idle_seconds)
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    try:
+        config = Config.from_env()
+    except RuntimeError as e:
+        print(f"config error: {e}", file=sys.stderr)
+        sys.exit(2)
+    try:
+        asyncio.run(run_forever(config))
+    except KeyboardInterrupt:
+        pass

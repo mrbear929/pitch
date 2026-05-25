@@ -1,0 +1,40 @@
+name: Release plugin
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: plugin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Verify build artifacts
+        run: |
+          test -f main.js
+          test -f manifest.json
+          test -f styles.css
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: |
+            plugin/main.js
+            plugin/manifest.json
+            plugin/styles.css

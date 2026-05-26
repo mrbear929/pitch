@@ -6,6 +6,7 @@ import logging
 import re
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 import httpx
 
@@ -24,7 +25,148 @@ from .render import FrameOcr, TranscriptSegment
 log = logging.getLogger(__name__)
 
 
-# ---- Fetcher ----
+# ---- Fetcher chain ----
+
+class CompositeFetcher(Fetcher):
+    """Try fetchers in order. First one that doesn't raise FetchError wins.
+
+    A fetcher that doesn't recognize the URL should raise FetchError; the next
+    fetcher gets a turn. When the chain is exhausted, the last error is raised.
+    """
+
+    def __init__(self, fetchers: list[Fetcher]) -> None:
+        if not fetchers:
+            raise ValueError("CompositeFetcher needs at least one fetcher")
+        self.fetchers = fetchers
+
+    def fetch(self, url: str, work_dir: Path) -> VideoMeta:
+        last_err: FetchError | None = None
+        for f in self.fetchers:
+            try:
+                return f.fetch(url, work_dir)
+            except FetchError as e:
+                log.info("fetcher %s declined: %s", type(f).__name__, e)
+                last_err = e
+                continue
+        assert last_err is not None
+        raise last_err
+
+
+_DOUYIN_VIDEO_ID = re.compile(r"douyin\.com/(?:video|note)/(\d+)")
+_MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+)
+
+
+def _extract_douyin_id(url: str) -> str | None:
+    """Pull the numeric aweme_id from any supported Douyin URL form."""
+    parsed = urlparse(url)
+    if "douyin" not in parsed.netloc and "iesdouyin" not in parsed.netloc:
+        return None
+    m = _DOUYIN_VIDEO_ID.search(url)
+    if m:
+        return m.group(1)
+    # /jingxuan?modal_id=<id>
+    qs = parse_qs(parsed.query)
+    if "modal_id" in qs and qs["modal_id"][0].isdigit():
+        return qs["modal_id"][0]
+    # /share/video/<id>/
+    if "/share/video/" in parsed.path:
+        tail = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+        if tail.isdigit():
+            return tail
+    return None
+
+
+class DouyinFetcher(Fetcher):
+    """Pulls video info from the iesdouyin.com share page (no auth, no cookies).
+
+    The share-page HTML embeds a JSON island that includes the unwatermarked
+    playback URL and the original title/duration. We parse the relevant fields
+    directly — robust enough for the formats we care about, and dependency-free.
+    """
+
+    SHARE = "https://www.iesdouyin.com/share/video/{id}/"
+
+    def fetch(self, url: str, work_dir: Path) -> VideoMeta:
+        aweme_id = _extract_douyin_id(url)
+        if not aweme_id:
+            raise FetchError(
+                f"DouyinFetcher: not a Douyin URL: {url}",
+                "Worker chain skipped Douyin scraper because the URL didn't look like one.",
+            )
+        try:
+            with httpx.Client(timeout=30.0, follow_redirects=True) as c:
+                r = c.get(self.SHARE.format(id=aweme_id), headers={"User-Agent": _MOBILE_UA})
+            r.raise_for_status()
+            html = r.text
+        except httpx.HTTPError as e:
+            raise FetchError(
+                f"DouyinFetcher: share-page fetch failed: {e}",
+                "Couldn't reach the Douyin share page. Try again in a minute.",
+            ) from e
+
+        info = self._parse_share_html(html)
+        if not info:
+            raise FetchError(
+                "DouyinFetcher: share page didn't contain a video URL",
+                "Douyin returned an unrecognized response. The post may be deleted, "
+                "private, or the share-page format may have changed.",
+            )
+
+        play_url = info["play_url"]
+        title = info.get("title") or f"douyin-{aweme_id}"
+        duration = float(info.get("duration") or 0.0)
+
+        media_path = work_dir / f"{aweme_id}.mp4"
+        try:
+            with httpx.Client(timeout=180.0, follow_redirects=True) as c:
+                with c.stream("GET", play_url, headers={"User-Agent": _MOBILE_UA}) as resp:
+                    resp.raise_for_status()
+                    with open(media_path, "wb") as f:
+                        for chunk in resp.iter_bytes(chunk_size=64 * 1024):
+                            f.write(chunk)
+        except httpx.HTTPError as e:
+            raise FetchError(
+                f"DouyinFetcher: download failed: {e}",
+                "Could resolve the Douyin video but the download failed. "
+                "Save the video on your phone and use 'Pitch: Upload Local File' (v0.2).",
+            ) from e
+
+        if media_path.stat().st_size < 1024:
+            raise FetchError(
+                "DouyinFetcher: downloaded file is implausibly small",
+                "Got a tiny file from Douyin — likely an error page. Try again later.",
+            )
+        return VideoMeta(title=title, duration_seconds=duration, media_path=media_path)
+
+    @staticmethod
+    def _parse_share_html(html: str) -> dict | None:
+        # The HTML embeds a JSON island whose strings use \uXXXX escapes for CJK.
+        # We unescape with json.loads on quoted-string fragments to round-trip
+        # the codepoints correctly.
+        title_m = re.search(r'"title":\s*("(?:[^"\\]|\\.){1,400}")', html)
+        title = json.loads(title_m.group(1)) if title_m else None
+
+        dur_m = re.search(r'"duration":(\d+)', html)
+        duration = int(dur_m.group(1)) / 1000.0 if dur_m else 0.0
+
+        url_m = re.search(
+            r'"play_addr":\{[^}]*?"url_list":\[(.*?)\]',
+            html,
+            re.DOTALL,
+        )
+        if not url_m:
+            return None
+        list_blob = url_m.group(1)
+        play_url_m = re.search(r'"(https[^"]+)"', list_blob)
+        if not play_url_m:
+            return None
+        # Same trick: re-quote and json-load to handle / and \uXXXX.
+        play_url = json.loads('"' + play_url_m.group(1) + '"')
+        return {"play_url": play_url, "title": title, "duration": duration}
+
 
 class YtDlpFetcher(Fetcher):
     """Uses the yt-dlp Python library."""
@@ -262,7 +404,7 @@ def make_default_pipeline(config):  # noqa: ANN001
     from .pipeline import Pipeline
 
     return Pipeline(
-        fetcher=YtDlpFetcher(),
+        fetcher=CompositeFetcher([DouyinFetcher(), YtDlpFetcher()]),
         audio=FfmpegAudioExtractor(),
         transcriber=WhisperCppTranscriber(config.whisper_bin, config.whisper_model),
         frames=FfmpegFrameSampler(),

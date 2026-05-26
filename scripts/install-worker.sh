@@ -51,17 +51,19 @@ cd "$WORKER_DIR"
 
 echo "==> Writing worker env (you must fill in dispatcher URL and worker token below)"
 if [ ! -f "$ENV_FILE" ]; then
+  WBIN=$(which whisper-cli || echo /opt/homebrew/bin/whisper-cli)
   cat > "$ENV_FILE" <<EOF
 # Pitch worker environment.
-# Fill in the values then: launchctl unload + launchctl load to apply.
-PITCH_DISPATCHER_URL=https://tools.mrbear929.com/pitch
-PITCH_WORKER_TOKEN=
-PITCH_WHISPER_BIN=$(which whisper-cli || echo /opt/homebrew/bin/whisper-cli)
-PITCH_WHISPER_MODEL=$MODEL_FILE
-PITCH_OLLAMA_URL=http://127.0.0.1:11434
-PITCH_OLLAMA_MODEL=qwen2.5:7b
-PITCH_FRAME_EVERY_SECONDS=30
-PITCH_WORK_DIR=$APP_SUPPORT/work
+# Fill in PITCH_WORKER_TOKEN, then: launchctl unload + launchctl load -w to apply.
+# Values containing spaces MUST be quoted.
+PITCH_DISPATCHER_URL="https://tools.mrbear929.com/pitch"
+PITCH_WORKER_TOKEN=""
+PITCH_WHISPER_BIN="$WBIN"
+PITCH_WHISPER_MODEL="$MODEL_FILE"
+PITCH_OLLAMA_URL="http://127.0.0.1:11434"
+PITCH_OLLAMA_MODEL="qwen2.5:7b"
+PITCH_FRAME_EVERY_SECONDS="30"
+PITCH_WORK_DIR="$APP_SUPPORT/work"
 EOF
   chmod 600 "$ENV_FILE"
   echo "Wrote $ENV_FILE — fill in PITCH_WORKER_TOKEN before loading the agent."

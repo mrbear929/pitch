@@ -67,7 +67,7 @@ WantedBy=multi-user.target
 EOF"
 
 echo "==> Reloading systemd, starting service"
-ssh_cmd 'sudo systemctl daemon-reload && sudo systemctl enable --now pitch'
+ssh_cmd 'sudo systemctl daemon-reload && sudo systemctl enable --now pitch && sudo systemctl restart pitch'
 
 echo "==> Adding nginx /pitch/ location to tools.mrbear929.com"
 ssh_cmd "sudo bash -c 'cat > /etc/nginx/snippets/pitch.conf <<EOF

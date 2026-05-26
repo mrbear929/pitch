@@ -15,6 +15,7 @@ class Config:
     whisper_model: str
     ollama_url: str
     ollama_model: str
+    vision_model: str  # "" disables vision analysis
     frame_every_seconds: int
     poll_idle_seconds: float
 
@@ -44,6 +45,7 @@ class Config:
             ),
             ollama_url=os.environ.get("PITCH_OLLAMA_URL", "http://127.0.0.1:11434"),
             ollama_model=os.environ.get("PITCH_OLLAMA_MODEL", "qwen2.5:7b"),
+            vision_model=os.environ.get("PITCH_VISION_MODEL", "qwen2.5vl:7b"),
             frame_every_seconds=int(os.environ.get("PITCH_FRAME_EVERY_SECONDS", "30")),
             poll_idle_seconds=float(os.environ.get("PITCH_POLL_IDLE_SECONDS", "5")),
         )

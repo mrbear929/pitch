@@ -2,7 +2,7 @@
 from pathlib import Path
 
 import pytest
-from worker.pipeline import FetchError, VideoMeta
+from worker.pipeline import FetchError, MediaBundle
 from worker.tools import CompositeFetcher, _extract_douyin_id
 
 
@@ -17,7 +17,7 @@ class FakeFetcher:
             raise self.behavior
         p = Path(work_dir) / "out.mp4"
         p.write_bytes(b"")
-        return VideoMeta(title=self.behavior, duration_seconds=1.0, media_path=p)
+        return MediaBundle(title=self.behavior, video_path=p, duration_seconds=1.0)
 
 
 def test_first_succeeds(tmp_path):

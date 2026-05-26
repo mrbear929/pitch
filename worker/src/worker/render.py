@@ -18,9 +18,21 @@ class TranscriptSegment:
 
 
 @dataclass
-class FrameOcr:
+class FrameVisual:
+    """A sampled video frame with what we know about it."""
+
     timestamp: float
-    text: str  # may be empty
+    ocr_text: str = ""           # may be empty
+    vision_description: str = "" # may be empty
+
+
+@dataclass
+class ImageVisual:
+    """A single image from a carousel post."""
+
+    index: int                   # 1-based for humans, 0-based on the wire
+    ocr_text: str = ""
+    vision_description: str = ""
 
 
 @dataclass
@@ -30,8 +42,10 @@ class LessonInputs:
     duration_seconds: float
     processed_at: datetime
     transcript: list[TranscriptSegment]
-    frames: list[FrameOcr]
-    summary: Optional[str] = None  # filled by LLM step (optional)
+    frame_visuals: list[FrameVisual]
+    image_visuals: list[ImageVisual]
+    has_video: bool
+    summary: Optional[str] = None
     key_points: list[str] = field(default_factory=list)
     tools_mentioned: list[str] = field(default_factory=list)
     code_snippets: list[str] = field(default_factory=list)
@@ -41,8 +55,11 @@ _TEMPLATE = """\
 # {{ title }}
 
 - **URL:** {{ source_url }}
+{% if has_video -%}
 - **Duration:** {{ duration }}
+{% endif -%}
 - **Processed:** {{ processed_at }}
+- **Type:** {{ media_type }}
 
 {% if summary -%}
 ## Summary
@@ -63,7 +80,7 @@ _TEMPLATE = """\
 {% endfor %}
 {% endif -%}
 {% if code_snippets -%}
-## Code / Commands (from frames)
+## Code / Commands
 
 {% for s in code_snippets %}```
 {{ s }}
@@ -71,21 +88,48 @@ _TEMPLATE = """\
 
 {% endfor -%}
 {% endif -%}
+{% if transcript -%}
 ## Transcript
 
 {% for seg in transcript -%}
 - `[{{ format_ts(seg.start) }}]` {{ seg.text }}
 {% endfor %}
 
-{% if non_empty_frames -%}
-## Frame OCR
+{% endif -%}
+{% if visible_frames -%}
+## Frame Visuals
 
-{% for f in non_empty_frames -%}
+{% for f in visible_frames -%}
 ### {{ format_ts(f.timestamp) }}
+{% if f.vision_description -%}
+{{ f.vision_description }}
+
+{% endif -%}
+{% if f.ocr_text -%}
+**OCR:**
 ```
-{{ f.text }}
+{{ f.ocr_text }}
 ```
 
+{% endif -%}
+{% endfor -%}
+{% endif -%}
+{% if visible_images -%}
+## Image Carousel
+
+{% for img in visible_images -%}
+### Image {{ img.index + 1 }}
+{% if img.vision_description -%}
+{{ img.vision_description }}
+
+{% endif -%}
+{% if img.ocr_text -%}
+**OCR:**
+```
+{{ img.ocr_text }}
+```
+
+{% endif -%}
 {% endfor -%}
 {% endif -%}
 """
@@ -95,16 +139,29 @@ def render_lesson(inputs: LessonInputs) -> str:
     env = Environment(undefined=StrictUndefined, trim_blocks=False, lstrip_blocks=False)
     env.globals["format_ts"] = format_ts
     template = env.from_string(_TEMPLATE)
-    non_empty_frames = [f for f in inputs.frames if f.text.strip()]
+    visible_frames = [f for f in inputs.frame_visuals if f.ocr_text.strip() or f.vision_description.strip()]
+    visible_images = [
+        img for img in inputs.image_visuals if img.ocr_text.strip() or img.vision_description.strip()
+    ]
+    media_type = (
+        "video + images"
+        if inputs.has_video and inputs.image_visuals
+        else "video"
+        if inputs.has_video
+        else "image carousel"
+    )
     return template.render(
         title=inputs.title,
         source_url=inputs.source_url,
         duration=format_ts(inputs.duration_seconds),
         processed_at=inputs.processed_at.strftime("%Y-%m-%d %H:%M %Z").strip(),
+        has_video=inputs.has_video,
+        media_type=media_type,
         summary=inputs.summary,
         key_points=inputs.key_points,
         tools_mentioned=inputs.tools_mentioned,
         code_snippets=inputs.code_snippets,
         transcript=inputs.transcript,
-        non_empty_frames=non_empty_frames,
+        visible_frames=visible_frames,
+        visible_images=visible_images,
     )

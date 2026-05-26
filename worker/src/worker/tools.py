@@ -1,6 +1,7 @@
 """Concrete pipeline implementations using yt-dlp, ffmpeg, whisper.cpp, tesseract, ollama."""
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -15,12 +16,13 @@ from .pipeline import (
     FetchError,
     Fetcher,
     FrameSampler,
+    MediaBundle,
     OcrRunner,
     Transcriber,
     Understander,
-    VideoMeta,
+    VisionAnalyzer,
 )
-from .render import FrameOcr, TranscriptSegment
+from .render import FrameVisual, ImageVisual, TranscriptSegment
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +41,7 @@ class CompositeFetcher(Fetcher):
             raise ValueError("CompositeFetcher needs at least one fetcher")
         self.fetchers = fetchers
 
-    def fetch(self, url: str, work_dir: Path) -> VideoMeta:
+    def fetch(self, url: str, work_dir: Path) -> MediaBundle:
         last_err: FetchError | None = None
         for f in self.fetchers:
             try:
@@ -80,16 +82,15 @@ def _extract_douyin_id(url: str) -> str | None:
 
 
 class DouyinFetcher(Fetcher):
-    """Pulls video info from the iesdouyin.com share page (no auth, no cookies).
+    """Pulls media info from the iesdouyin.com share page (no auth, no cookies).
 
-    The share-page HTML embeds a JSON island that includes the unwatermarked
-    playback URL and the original title/duration. We parse the relevant fields
-    directly — robust enough for the formats we care about, and dependency-free.
+    Handles both video posts and image-carousel posts ("note" / aweme_type=2).
+    The share-page HTML embeds a JSON island; we parse the relevant fields directly.
     """
 
     SHARE = "https://www.iesdouyin.com/share/video/{id}/"
 
-    def fetch(self, url: str, work_dir: Path) -> VideoMeta:
+    def fetch(self, url: str, work_dir: Path) -> MediaBundle:
         aweme_id = _extract_douyin_id(url)
         if not aweme_id:
             raise FetchError(
@@ -110,15 +111,33 @@ class DouyinFetcher(Fetcher):
         info = self._parse_share_html(html)
         if not info:
             raise FetchError(
-                "DouyinFetcher: share page didn't contain a video URL",
+                "DouyinFetcher: share page didn't contain recognizable media",
                 "Douyin returned an unrecognized response. The post may be deleted, "
                 "private, or the share-page format may have changed.",
             )
 
-        play_url = info["play_url"]
         title = info.get("title") or f"douyin-{aweme_id}"
-        duration = float(info.get("duration") or 0.0)
 
+        # Image-carousel post.
+        if info.get("image_urls"):
+            image_paths = self._download_images(info["image_urls"], aweme_id, work_dir)
+            return MediaBundle(title=title, image_paths=image_paths)
+
+        # Video post.
+        if info.get("play_url"):
+            video_path = self._download_video(info["play_url"], aweme_id, work_dir)
+            return MediaBundle(
+                title=title,
+                video_path=video_path,
+                duration_seconds=float(info.get("duration") or 0.0),
+            )
+
+        raise FetchError(
+            "DouyinFetcher: share page parsed but no media found",
+            "Douyin returned a response we couldn't classify as video or images.",
+        )
+
+    def _download_video(self, play_url: str, aweme_id: str, work_dir: Path) -> Path:
         media_path = work_dir / f"{aweme_id}.mp4"
         try:
             with httpx.Client(timeout=180.0, follow_redirects=True) as c:
@@ -129,17 +148,38 @@ class DouyinFetcher(Fetcher):
                             f.write(chunk)
         except httpx.HTTPError as e:
             raise FetchError(
-                f"DouyinFetcher: download failed: {e}",
-                "Could resolve the Douyin video but the download failed. "
-                "Save the video on your phone and use 'Pitch: Upload Local File' (v0.2).",
+                f"DouyinFetcher: video download failed: {e}",
+                "Could resolve the Douyin video but the download failed. Try again later.",
             ) from e
-
         if media_path.stat().st_size < 1024:
             raise FetchError(
                 "DouyinFetcher: downloaded file is implausibly small",
                 "Got a tiny file from Douyin — likely an error page. Try again later.",
             )
-        return VideoMeta(title=title, duration_seconds=duration, media_path=media_path)
+        return media_path
+
+    def _download_images(self, urls: list[str], aweme_id: str, work_dir: Path) -> list[Path]:
+        out: list[Path] = []
+        for i, image_url in enumerate(urls):
+            target = work_dir / f"{aweme_id}-{i:02d}.jpg"
+            try:
+                with httpx.Client(timeout=60.0, follow_redirects=True) as c:
+                    resp = c.get(image_url, headers={"User-Agent": _MOBILE_UA})
+                resp.raise_for_status()
+                target.write_bytes(resp.content)
+            except httpx.HTTPError:
+                log.warning("image %d/%d failed; skipping", i + 1, len(urls))
+                continue
+            if target.stat().st_size < 200:
+                log.warning("image %d/%d implausibly small; skipping", i + 1, len(urls))
+                continue
+            out.append(target)
+        if not out:
+            raise FetchError(
+                "DouyinFetcher: all images failed to download",
+                "Found image carousel but couldn't download any image. Try again later.",
+            )
+        return out
 
     @staticmethod
     def _parse_share_html(html: str) -> dict | None:
@@ -149,6 +189,17 @@ class DouyinFetcher(Fetcher):
         title_m = re.search(r'"title":\s*("(?:[^"\\]|\\.){1,400}")', html)
         title = json.loads(title_m.group(1)) if title_m else None
 
+        # Detect image-carousel posts (aweme_type=2).
+        aweme_type_m = re.search(r'"aweme_type":(\d+)', html)
+        is_images = bool(aweme_type_m) and aweme_type_m.group(1) == "2"
+
+        if is_images:
+            image_urls = DouyinFetcher._parse_image_urls(html)
+            if image_urls:
+                return {"title": title, "image_urls": image_urls}
+            # Fall through — sometimes posts marked aweme_type=2 still have a
+            # video. Try the video path before giving up.
+
         dur_m = re.search(r'"duration":(\d+)', html)
         duration = int(dur_m.group(1)) / 1000.0 if dur_m else 0.0
 
@@ -157,21 +208,55 @@ class DouyinFetcher(Fetcher):
             html,
             re.DOTALL,
         )
-        if not url_m:
-            return None
-        list_blob = url_m.group(1)
-        play_url_m = re.search(r'"(https[^"]+)"', list_blob)
-        if not play_url_m:
-            return None
-        # Same trick: re-quote and json-load to handle / and \uXXXX.
-        play_url = json.loads('"' + play_url_m.group(1) + '"')
-        return {"play_url": play_url, "title": title, "duration": duration}
+        if url_m:
+            list_blob = url_m.group(1)
+            play_url_m = re.search(r'"(https[^"]+)"', list_blob)
+            if play_url_m:
+                play_url = json.loads('"' + play_url_m.group(1) + '"')
+                return {
+                    "title": title,
+                    "play_url": play_url,
+                    "duration": duration,
+                }
+        return None
+
+    @staticmethod
+    def _parse_image_urls(html: str) -> list[str]:
+        """Walk every slide ({"uri":"...","url_list":[...]}) that follows
+        an "images":[ marker, take the first https URL per slide, dedupe.
+        """
+        urls: list[str] = []
+        for m in re.finditer(r'"images":\[', html):
+            tail = html[m.end():]
+            # Walk each {"uri":"...","url_list":[...]} object until the array closes.
+            for slide_m in re.finditer(
+                r'\{"uri":"[^"]*","url_list":\[(.*?)\]',
+                tail,
+                re.DOTALL,
+            ):
+                url_blob = slide_m.group(1)
+                # Stop once we leave this images array.
+                # Rough guard: if we've already walked >5KB into the tail it's
+                # almost certainly past this images block.
+                if slide_m.start() > 20_000:
+                    break
+                u_m = re.search(r'"(https[^"]+)"', url_blob)
+                if u_m:
+                    urls.append(json.loads('"' + u_m.group(1) + '"'))
+        # Dedupe while preserving order.
+        seen = set()
+        deduped: list[str] = []
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                deduped.append(u)
+        return deduped
 
 
 class YtDlpFetcher(Fetcher):
-    """Uses the yt-dlp Python library."""
+    """Uses the yt-dlp Python library. Video posts only — no carousel support."""
 
-    def fetch(self, url: str, work_dir: Path) -> VideoMeta:
+    def fetch(self, url: str, work_dir: Path) -> MediaBundle:
         from yt_dlp import YoutubeDL  # lazy: keep import optional for tests
         from yt_dlp.utils import DownloadError
 
@@ -194,10 +279,10 @@ class YtDlpFetcher(Fetcher):
         media_path = Path(ydl.prepare_filename(info))  # type: ignore[arg-type]
         if not media_path.exists():
             raise FetchError("yt-dlp finished but file missing", "Try uploading the file manually.")
-        return VideoMeta(
+        return MediaBundle(
             title=info.get("title") or media_path.stem,
+            video_path=media_path,
             duration_seconds=float(info.get("duration") or 0.0),
-            media_path=media_path,
         )
 
     @staticmethod
@@ -337,7 +422,9 @@ class TesseractOcrRunner(OcrRunner):
 # ---- Understanding (optional, local Ollama) ----
 
 OLLAMA_PROMPT = """\
-You will receive a transcript of a vibe-coding tutorial video and OCR text from key frames.
+You are converting a vibe-coding/tech post into a structured engineering note.
+You will receive: a spoken transcript (may be empty for image-only posts),
+visual descriptions of key frames or carousel images, and OCR text.
 
 Output VALID JSON only. No prose, no markdown fences.
 
@@ -346,12 +433,11 @@ Schema:
   "summary": "<2-3 sentence summary>",
   "key_points": ["<bullet>", ...],
   "tools_mentioned": ["<name>", ...],
-  "code_snippets": ["<short code or command>", ...]
+  "code_snippets": ["<short code or command, exact text>", ...]
 }
 
 If the content is sparse, use empty arrays. Always return all four keys.
 
-TRANSCRIPT:
 """
 
 
@@ -361,11 +447,23 @@ class OllamaUnderstander(Understander):
         self.model = model
 
     def understand(
-        self, transcript: list[TranscriptSegment], frames: list[FrameOcr]
+        self,
+        transcript: list[TranscriptSegment],
+        frame_visuals: list[FrameVisual],
+        image_visuals: list[ImageVisual],
     ) -> dict:
-        transcript_text = "\n".join(seg.text for seg in transcript)[:12000]
-        ocr_text = "\n---\n".join(f.text for f in frames if f.text.strip())[:6000]
-        prompt = OLLAMA_PROMPT + transcript_text + "\n\nOCR TEXT:\n" + ocr_text
+        transcript_text = "\n".join(seg.text for seg in transcript)[:10000]
+        frame_text = "\n\n".join(self._frame_block(f) for f in frame_visuals)[:6000]
+        image_text = "\n\n".join(self._image_block(i) for i in image_visuals)[:6000]
+
+        prompt_parts = [OLLAMA_PROMPT]
+        if transcript_text:
+            prompt_parts.append("TRANSCRIPT:\n" + transcript_text)
+        if frame_text:
+            prompt_parts.append("FRAME VISUALS:\n" + frame_text)
+        if image_text:
+            prompt_parts.append("CAROUSEL IMAGES:\n" + image_text)
+        prompt = "\n\n".join(prompt_parts)
 
         try:
             with httpx.Client(timeout=300.0) as c:
@@ -386,8 +484,26 @@ class OllamaUnderstander(Understander):
             return {}
 
     @staticmethod
+    def _frame_block(f: FrameVisual) -> str:
+        ts = format_ts(f.timestamp)  # noqa: F821 — provided below
+        parts = [f"[{ts}]"]
+        if f.vision_description:
+            parts.append("vision: " + f.vision_description)
+        if f.ocr_text:
+            parts.append("ocr: " + f.ocr_text)
+        return " ".join(parts)
+
+    @staticmethod
+    def _image_block(i: ImageVisual) -> str:
+        parts = [f"[image {i.index + 1}]"]
+        if i.vision_description:
+            parts.append("vision: " + i.vision_description)
+        if i.ocr_text:
+            parts.append("ocr: " + i.ocr_text)
+        return " ".join(parts)
+
+    @staticmethod
     def _parse(raw: str) -> dict:
-        # Ollama with format=json should give pure JSON, but guard anyway.
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
@@ -400,14 +516,67 @@ class OllamaUnderstander(Understander):
             return {}
 
 
+# ---- Vision (multimodal local LLM) ----
+
+class OllamaVisionAnalyzer(VisionAnalyzer):
+    """Describe an image's visual content via a local multimodal model.
+
+    Uses Ollama's /api/generate with `images: [base64]`. The default prompt
+    is tuned for vibe-coding posts — diagrams, screenshots, code, slides — but
+    works fine on general scenes too.
+    """
+
+    DEFAULT_PROMPT = (
+        "Describe what is shown in this image in 1-2 sentences. "
+        "If you can read text, code, or commands, transcribe them verbatim. "
+        "If it's a diagram, describe the structure. Be concrete, no fluff."
+    )
+
+    def __init__(self, base_url: str, model: str, prompt: str | None = None) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.prompt = prompt or self.DEFAULT_PROMPT
+
+    def describe(self, image_path: Path) -> str:
+        if not image_path.exists():
+            return ""
+        try:
+            payload = base64.b64encode(image_path.read_bytes()).decode("ascii")
+            with httpx.Client(timeout=300.0) as c:
+                r = c.post(
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.model,
+                        "prompt": self.prompt,
+                        "images": [payload],
+                        "stream": False,
+                    },
+                )
+            r.raise_for_status()
+            body = r.json()
+            return (body.get("response") or "").strip()
+        except Exception as e:
+            log.warning("vision describe failed for %s: %s", image_path.name, e)
+            return ""
+
+
+# Re-export format_ts for OllamaUnderstander._frame_block.
+from .text import format_ts  # noqa: E402
+
+
 def make_default_pipeline(config):  # noqa: ANN001
     from .pipeline import Pipeline
 
+    vision_model = getattr(config, "vision_model", "") or ""
+    vision = (
+        OllamaVisionAnalyzer(config.ollama_url, vision_model) if vision_model else None
+    )
     return Pipeline(
         fetcher=CompositeFetcher([DouyinFetcher(), YtDlpFetcher()]),
         audio=FfmpegAudioExtractor(),
         transcriber=WhisperCppTranscriber(config.whisper_bin, config.whisper_model),
         frames=FfmpegFrameSampler(),
         ocr=TesseractOcrRunner(),
+        vision=vision,
         understander=OllamaUnderstander(config.ollama_url, config.ollama_model),
     )

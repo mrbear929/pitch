@@ -28,6 +28,7 @@ export class Setting {
   setName() { return this; }
   setDesc() { return this; }
   addText() { return this; }
+  addTextArea() { return this; }
   addButton() { return this; }
   addToggle() { return this; }
 }

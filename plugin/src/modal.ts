@@ -4,14 +4,15 @@ import { ApiError, AuthError, PitchClient } from "./api";
 import { ActiveJob, formatElapsed, JobTracker } from "./job-tracker";
 
 /**
- * Submit a URL, then close. Polling continues in the background via JobTracker.
+ * Submit one or many URLs (one per line), then close. Polling continues
+ * in the background via JobTracker.
  *
- * If there are jobs already running when this modal opens, show them at the top
- * with live status — this is how the user knows something is in flight without
- * needing a permanent status-bar widget.
+ * Multi-URL paste pattern: copy a column from a doc/screenshot list and paste
+ * straight in. Empty lines and #comments are ignored. Schemeless URLs (e.g.
+ * `douyin.com/video/123`) are accepted — the worker normalizes them.
  */
 export class IngestUrlModal extends Modal {
-  private url = "";
+  private urlsRaw = "";
   private topicHint = "";
   private submitting = false;
   private statusEl: HTMLElement | null = null;
@@ -28,24 +29,28 @@ export class IngestUrlModal extends Modal {
 
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl("h2", { text: "Pitch: Ingest URL" });
+    contentEl.createEl("h2", { text: "Pitch: Ingest URLs" });
 
-    // Status panel — only renders when there's something to show.
     this.statusEl = contentEl.createEl("div", { cls: "pitch-status-panel" });
     this.renderStatus();
     this.unsubscribe = this.tracker.onChange(() => this.renderStatus());
-    // Tick every second so elapsed times update while modal is open.
     this.refreshInterval = window.setInterval(() => this.renderStatus(), 1000);
 
     new Setting(contentEl)
-      .setName("Video URL")
-      .setDesc("Douyin, YouTube, or any yt-dlp-compatible link.")
-      .addText((t) => {
-        t.inputEl.classList.add("pitch-modal-input");
+      .setName("Video URLs")
+      .setDesc(
+        "Paste one URL per line. Douyin, YouTube, or any yt-dlp-supported link. " +
+          "Schemeless URLs are fine.",
+      )
+      .addTextArea((t) => {
+        t.inputEl.classList.add("pitch-modal-textarea");
+        t.inputEl.rows = 6;
         t.inputEl.setAttribute("autofocus", "true");
-        t.onChange((v) => (this.url = v.trim()));
+        t.inputEl.placeholder = "douyin.com/video/123\ndouyin.com/video/456\n...";
+        t.onChange((v) => (this.urlsRaw = v));
+        // Cmd/Ctrl+Enter submits; plain Enter inserts a newline.
         t.inputEl.addEventListener("keydown", (e) => {
-          if (e.key === "Enter") {
+          if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
             e.preventDefault();
             this.submit();
           }
@@ -54,6 +59,7 @@ export class IngestUrlModal extends Modal {
 
     new Setting(contentEl)
       .setName("Topic hint (optional)")
+      .setDesc("Applied to all URLs in this batch.")
       .addText((t) => {
         t.inputEl.classList.add("pitch-modal-input");
         t.onChange((v) => (this.topicHint = v.trim()));
@@ -68,7 +74,7 @@ export class IngestUrlModal extends Modal {
 
     contentEl.createEl("div", {
       cls: "pitch-progress",
-      text: "Submission runs in the background. You'll see a Notice when the note is ready.",
+      text: "Cmd/Ctrl+Enter submits. Jobs run in parallel; you'll get a Notice per job.",
     });
   }
 
@@ -83,9 +89,7 @@ export class IngestUrlModal extends Modal {
       text: `Active jobs (${jobs.length})`,
     });
     const list = this.statusEl.createEl("ul", { cls: "pitch-status-list" });
-    for (const job of jobs) {
-      this.renderJobRow(list, job);
-    }
+    for (const job of jobs) this.renderJobRow(list, job);
   }
 
   private renderJobRow(parent: HTMLElement, job: ActiveJob): void {
@@ -101,33 +105,50 @@ export class IngestUrlModal extends Modal {
 
   private async submit() {
     if (this.submitting) return;
-    if (!this.url) {
-      new Notice("Pitch: paste a URL first");
+    const urls = parseUrlList(this.urlsRaw);
+    if (urls.length === 0) {
+      new Notice("Pitch: paste at least one URL");
       return;
     }
     this.submitting = true;
 
-    try {
-      const sub = await this.client.submitUrl(this.url, this.topicHint || undefined);
-      const label = this.shortLabel(this.url);
-      this.tracker.track(sub.id, label);
-      new Notice(`Pitch [${label}]: queued. I'll notify when done.`, 5_000);
-      this.close();
-    } catch (e) {
-      if (e instanceof AuthError) {
-        new Notice("Pitch: API key rejected. Check Settings → Pitch.", 8_000);
-      } else if (e instanceof ApiError) {
-        new Notice(`Pitch: server returned ${e.status}: ${e.message.slice(0, 200)}`, 8_000);
-      } else {
-        new Notice(`Pitch: ${(e as Error).message}`, 8_000);
+    let queued = 0;
+    const failed: string[] = [];
+    for (const url of urls) {
+      try {
+        const sub = await this.client.submitUrl(
+          url,
+          this.topicHint || undefined,
+        );
+        this.tracker.track(sub.id, this.shortLabel(url));
+        queued += 1;
+      } catch (e) {
+        failed.push(this.errMessage(url, e));
       }
-      this.submitting = false;
     }
+
+    if (queued > 0) {
+      new Notice(
+        `Pitch: queued ${queued} job${queued === 1 ? "" : "s"}. I'll notify per job.`,
+        5_000,
+      );
+    }
+    for (const msg of failed) new Notice(msg, 8_000);
+    if (queued > 0) this.close();
+    else this.submitting = false;
+  }
+
+  private errMessage(url: string, e: unknown): string {
+    const tail = this.shortLabel(url);
+    if (e instanceof AuthError) return `Pitch [${tail}]: API key rejected.`;
+    if (e instanceof ApiError) return `Pitch [${tail}]: server ${e.status}.`;
+    return `Pitch [${tail}]: ${(e as Error).message}`;
   }
 
   private shortLabel(url: string): string {
+    const normalized = url.includes("://") ? url : `https://${url}`;
     try {
-      const u = new URL(url);
+      const u = new URL(normalized);
       const host = u.hostname.replace(/^www\./, "");
       const tail = u.pathname.split("/").filter(Boolean).pop() || "";
       return tail ? `${host}/${tail.slice(0, 24)}` : host;
@@ -147,4 +168,21 @@ export class IngestUrlModal extends Modal {
     }
     this.contentEl.empty();
   }
+}
+
+/**
+ * Pure: split a multi-line paste into one URL per non-empty, non-comment line.
+ * Trims whitespace. Drops # comments and blank lines. Dedupes preserving order.
+ */
+export function parseUrlList(raw: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    if (seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
 }

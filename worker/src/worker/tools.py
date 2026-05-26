@@ -65,10 +65,12 @@ _MOBILE_UA = (
 
 
 def _extract_douyin_id(url: str) -> str | None:
-    parsed = urlparse(url)
+    # Accept schemeless URLs like "douyin.com/video/123" — users paste these.
+    normalized = url if "://" in url else f"https://{url}"
+    parsed = urlparse(normalized)
     if "douyin" not in parsed.netloc and "iesdouyin" not in parsed.netloc:
         return None
-    m = _DOUYIN_VIDEO_ID.search(url)
+    m = _DOUYIN_VIDEO_ID.search(normalized)
     if m:
         return m.group(1)
     qs = parse_qs(parsed.query)

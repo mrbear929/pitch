@@ -59,6 +59,9 @@ def test_empty_chain_rejected():
         ("https://www.douyin.com/note/7618972935072366505", "7618972935072366505"),
         ("https://www.douyin.com/jingxuan?modal_id=7618972935072366505", "7618972935072366505"),
         ("https://www.iesdouyin.com/share/video/7618972935072366505/", "7618972935072366505"),
+        # Schemeless — users paste these. Must work too.
+        ("douyin.com/video/7634862226716757283", "7634862226716757283"),
+        ("www.douyin.com/note/7618972935072366505", "7618972935072366505"),
         ("https://www.youtube.com/watch?v=jNQXAC9IVRw", None),
         ("https://example.com/", None),
     ],

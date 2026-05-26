@@ -470,6 +470,7 @@ class OllamaUnderstander(Understander):
                         "prompt": prompt,
                         "stream": False,
                         "format": "json",
+                        "keep_alive": "30m",
                     },
                 )
             r.raise_for_status()
@@ -528,6 +529,15 @@ class OllamaVisionAnalyzer(VisionAnalyzer):
         "If it's a diagram, describe the structure. Be concrete, no fluff."
     )
 
+    # Long edge passed to the vision model. Larger ⇒ more detail but slower.
+    # 1024 keeps fine-grained text legible while cutting inference cost ~75%
+    # vs typical Douyin source images (1860×2475).
+    MAX_LONG_EDGE = 1024
+
+    # Tell Ollama to keep the model resident this long after a call. Eliminates
+    # cold-start on the next image / next job.
+    KEEP_ALIVE = "30m"
+
     def __init__(self, base_url: str, model: str, prompt: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -537,9 +547,9 @@ class OllamaVisionAnalyzer(VisionAnalyzer):
         if not image_path.exists():
             return ""
         try:
-            payload = base64.b64encode(image_path.read_bytes()).decode("ascii")
-            # 10 min timeout — first-call cold-start on qwen2.5vl can be 1-2 min,
-            # then ~30s per image steady-state. Be generous.
+            payload = self._encode_resized(image_path)
+            # 10 min timeout — covers cold-start on first call. Steady-state
+            # is ~10-20s per image once the model is warm.
             with httpx.Client(timeout=600.0) as c:
                 r = c.post(
                     f"{self.base_url}/api/generate",
@@ -548,6 +558,7 @@ class OllamaVisionAnalyzer(VisionAnalyzer):
                         "prompt": self.prompt,
                         "images": [payload],
                         "stream": False,
+                        "keep_alive": self.KEEP_ALIVE,
                     },
                 )
             r.raise_for_status()
@@ -556,6 +567,34 @@ class OllamaVisionAnalyzer(VisionAnalyzer):
         except Exception as e:
             log.warning("vision describe failed for %s: %s", image_path.name, e)
             return ""
+
+    def _encode_resized(self, image_path: Path) -> str:
+        """Resize the image so its long edge is MAX_LONG_EDGE, re-encode as JPEG.
+
+        Reasons:
+          1. Faster vision inference — far fewer tokens for the model to process.
+          2. Ollama's vision endpoint takes JPEG/PNG; some Douyin images are .webp
+             with broken metadata that can confuse the model. Re-encoding
+             normalizes everything to safe JPEG.
+        """
+        try:
+            from PIL import Image
+        except ImportError:
+            # Fallback: send raw bytes if Pillow isn't installed.
+            return base64.b64encode(image_path.read_bytes()).decode("ascii")
+        from io import BytesIO
+
+        img = Image.open(image_path)
+        if img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        long_edge = max(img.size)
+        if long_edge > self.MAX_LONG_EDGE:
+            scale = self.MAX_LONG_EDGE / long_edge
+            new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
+            img = img.resize(new_size, Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 # Re-export format_ts for OllamaUnderstander._frame_block.

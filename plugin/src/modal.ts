@@ -1,21 +1,22 @@
-import { App, Modal, Notice, Setting, TFile } from "obsidian";
+import { App, Modal, Notice, Setting } from "obsidian";
 
-import { ApiError, AuthError, JobView, PitchClient } from "./api";
-import { pollUntilDone } from "./poll";
-import { PitchSettings } from "./settings";
-import { filenameFor } from "./slug";
-import { uniquePath } from "./vault";
+import { ApiError, AuthError, PitchClient } from "./api";
+import { JobTracker } from "./job-tracker";
 
+/**
+ * Submit a URL, then close. Polling continues in the background via JobTracker;
+ * the user sees an Obsidian Notice when the note lands or fails. The modal does
+ * NOT block Obsidian or stay open through processing.
+ */
 export class IngestUrlModal extends Modal {
   private url = "";
   private topicHint = "";
-  private progressEl?: HTMLElement;
   private submitting = false;
 
   constructor(
     app: App,
     private client: PitchClient,
-    private settings: PitchSettings,
+    private tracker: JobTracker,
   ) {
     super(app);
   }
@@ -26,16 +27,21 @@ export class IngestUrlModal extends Modal {
 
     new Setting(contentEl)
       .setName("Video URL")
-      .setDesc("Paste a Douyin, YouTube, or other supported link.")
+      .setDesc("Douyin, YouTube, or any yt-dlp-compatible link.")
       .addText((t) => {
         t.inputEl.classList.add("pitch-modal-input");
         t.inputEl.setAttribute("autofocus", "true");
         t.onChange((v) => (this.url = v.trim()));
+        t.inputEl.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            this.submit();
+          }
+        });
       });
 
     new Setting(contentEl)
-      .setName("Topic hint")
-      .setDesc("Optional. Helps the worker pick a slug.")
+      .setName("Topic hint (optional)")
       .addText((t) => {
         t.inputEl.classList.add("pitch-modal-input");
         t.onChange((v) => (this.topicHint = v.trim()));
@@ -43,52 +49,30 @@ export class IngestUrlModal extends Modal {
 
     new Setting(contentEl).addButton((b) =>
       b
-        .setButtonText("Ingest")
+        .setButtonText("Send to Pitch")
         .setCta()
         .onClick(() => this.submit()),
     );
 
-    this.progressEl = contentEl.createEl("div", { cls: "pitch-progress" });
-  }
-
-  private setProgress(text: string) {
-    if (this.progressEl) this.progressEl.setText(text);
+    contentEl.createEl("div", {
+      cls: "pitch-progress",
+      text: "Submission runs in the background. You'll see a Notice when the note is ready.",
+    });
   }
 
   private async submit() {
     if (this.submitting) return;
     if (!this.url) {
-      new Notice("Pitch: please paste a URL");
+      new Notice("Pitch: paste a URL first");
       return;
     }
-    if (!this.settings.apiKey) {
-      new Notice("Pitch: set the API key in Settings → Pitch");
-      return;
-    }
-
     this.submitting = true;
-    this.setProgress("Submitting…");
 
     try {
       const sub = await this.client.submitUrl(this.url, this.topicHint || undefined);
-      this.setProgress(`Submitted. Job ${sub.id}. Polling…`);
-
-      const job = await pollUntilDone(this.client, sub.id, {
-        intervalMs: this.settings.pollIntervalMs,
-        timeoutMs: this.settings.pollTimeoutMs,
-        onStatus: (j) => this.setProgress(this.statusLine(j)),
-      });
-
-      if (job.status === "failed") {
-        new Notice(
-          `Pitch: ${job.user_guidance || job.error || "Job failed."}`,
-          12_000,
-        );
-        this.close();
-        return;
-      }
-      await this.writeNote(job);
-      new Notice(`Pitch: note saved.`, 4_000);
+      const label = this.shortLabel(this.url);
+      this.tracker.track(sub.id, label);
+      new Notice(`Pitch [${label}]: queued (${sub.id.slice(0, 6)}). I'll notify when done.`, 5_000);
       this.close();
     } catch (e) {
       if (e instanceof AuthError) {
@@ -98,34 +82,19 @@ export class IngestUrlModal extends Modal {
       } else {
         new Notice(`Pitch: ${(e as Error).message}`, 8_000);
       }
-    } finally {
       this.submitting = false;
     }
   }
 
-  private statusLine(j: JobView): string {
-    const tail = j.progress_message ? ` — ${j.progress_message}` : "";
-    return `${j.status}${tail}`;
-  }
-
-  private async writeNote(job: JobView): Promise<void> {
-    if (!job.result_markdown) {
-      throw new Error("Job done but no markdown returned");
+  private shortLabel(url: string): string {
+    try {
+      const u = new URL(url);
+      const host = u.hostname.replace(/^www\./, "");
+      const tail = u.pathname.split("/").filter(Boolean).pop() || "";
+      return tail ? `${host}/${tail.slice(0, 24)}` : host;
+    } catch {
+      return url.slice(0, 40);
     }
-    const folder = this.settings.outputFolder;
-    await this.ensureFolder(folder);
-    const filename = filenameFor(job.result_title || "video");
-    const path = await uniquePath(folder, filename, async (p) =>
-      this.app.vault.getAbstractFileByPath(p) !== null,
-    );
-    const file = await this.app.vault.create(path, job.result_markdown);
-    await this.app.workspace.getLeaf(true).openFile(file as TFile);
-  }
-
-  private async ensureFolder(path: string): Promise<void> {
-    const existing = this.app.vault.getAbstractFileByPath(path);
-    if (existing) return;
-    await this.app.vault.createFolder(path);
   }
 
   onClose() {

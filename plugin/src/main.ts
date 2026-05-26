@@ -1,12 +1,14 @@
 import { Plugin, requestUrl } from "obsidian";
 
 import { obsidianHttp, PitchClient } from "./api";
+import { JobTracker } from "./job-tracker";
 import { IngestUrlModal } from "./modal";
 import { PitchSettingsTab } from "./settings-tab";
 import { DEFAULT_SETTINGS, PitchSettings } from "./settings";
 
 export default class PitchPlugin extends Plugin {
   settings: PitchSettings = DEFAULT_SETTINGS;
+  private tracker: JobTracker | null = null;
 
   async onload() {
     await this.loadSettings();
@@ -21,9 +23,17 @@ export default class PitchPlugin extends Plugin {
           this.settings.apiKey,
           obsidianHttp(requestUrl),
         );
-        new IngestUrlModal(this.app, client, this.settings).open();
+        if (!this.tracker) {
+          this.tracker = new JobTracker({ app: this.app, client, settings: this.settings });
+        }
+        new IngestUrlModal(this.app, client, this.tracker).open();
       },
     });
+  }
+
+  onunload() {
+    this.tracker?.cancelAll();
+    this.tracker = null;
   }
 
   async loadSettings() {

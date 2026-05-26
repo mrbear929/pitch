@@ -451,10 +451,9 @@ class GeminiVideoUnderstander(VideoUnderstander):
                 },
             },
         }
-        with httpx.Client(timeout=600.0) as c:
-            r = c.post(url, json=payload)
-        r.raise_for_status()
-        body = r.json()
+        # Free-tier Gemini occasionally returns 503/429 under load. Retry a few
+        # times with exponential backoff before giving up.
+        body = self._call_with_retry(url, payload)
 
         try:
             text = body["candidates"][0]["content"]["parts"][0]["text"]
@@ -462,6 +461,33 @@ class GeminiVideoUnderstander(VideoUnderstander):
         except (KeyError, IndexError, json.JSONDecodeError) as e:
             log.warning("Gemini returned unparseable response: %s", e)
             return {}
+
+    @staticmethod
+    def _call_with_retry(url: str, payload: dict) -> dict:
+        """Hit generateContent with retry on 429/503/504 (free-tier overload)."""
+        delay = 2.0
+        last_exc: Exception | None = None
+        for attempt in range(5):
+            try:
+                with httpx.Client(timeout=600.0) as c:
+                    r = c.post(url, json=payload)
+                if r.status_code in (429, 502, 503, 504):
+                    log.warning(
+                        "Gemini transient %s (attempt %d/5), retrying in %.1fs",
+                        r.status_code, attempt + 1, delay,
+                    )
+                    time.sleep(delay)
+                    delay = min(delay * 2, 30)
+                    continue
+                r.raise_for_status()
+                return r.json()
+            except (httpx.HTTPStatusError, httpx.HTTPError) as e:
+                last_exc = e
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Gemini retries exhausted")
 
     # ----- Files API helpers -----
 

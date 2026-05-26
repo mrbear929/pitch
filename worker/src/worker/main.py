@@ -59,7 +59,6 @@ async def process_one(client: DispatcherClient, pipeline: Pipeline, config: Conf
                 pipeline,
                 job.url or "",
                 job_dir,
-                config.frame_every_seconds,
                 progress_cb,
             )
         finally:
@@ -112,14 +111,12 @@ def _run_pipeline_with_progress(
     pipeline: Pipeline,
     url: str,
     job_dir: Path,
-    frame_every_seconds: int,
     progress_cb,
 ) -> PipelineResult:
     """Sync wrapper that owns the heavy lifting."""
     return pipeline.run(
         url=url,
         work_dir=job_dir,
-        frame_every_seconds=frame_every_seconds,
         progress_cb=progress_cb,
     )
 

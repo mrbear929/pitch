@@ -1,5 +1,5 @@
 import { JobView, PitchClient, PitchHttp } from "../src/api";
-import { JobTracker } from "../src/job-tracker";
+import { formatElapsed, JobTracker } from "../src/job-tracker";
 
 function buildClient(jobs: JobView[]): PitchClient {
   let i = 0;
@@ -22,19 +22,26 @@ const jobView = (over: Partial<JobView> = {}): JobView => ({
   result_slug: null,
   error: null,
   user_guidance: null,
+  result_attachments: [],
   ...over,
 });
 
 function fakeApp() {
   const created: { path: string; data: string }[] = [];
+  const createdBinary: { path: string; size: number }[] = [];
   const folders: string[] = [];
   return {
     created,
+    createdBinary,
     folders,
     vault: {
       getAbstractFileByPath: () => null,
       create: async (p: string, data: string) => {
         created.push({ path: p, data });
+        return { path: p };
+      },
+      createBinary: async (p: string, data: ArrayBuffer) => {
+        createdBinary.push({ path: p, size: data.byteLength });
         return { path: p };
       },
       createFolder: async (p: string) => {
@@ -117,7 +124,56 @@ describe("JobTracker", () => {
     tracker.track("b", "beta");
     tracker.track("c", "gamma");
     expect(tracker.activeCount).toBe(3);
+    expect(tracker.getActive()).toHaveLength(3);
     tracker.cancelAll();
     expect(tracker.activeCount).toBe(0);
+    expect(tracker.getActive()).toHaveLength(0);
+  });
+
+  test("attachments are written as binaries before the markdown file", async () => {
+    const client = buildClient([
+      jobView({
+        status: "done",
+        result_markdown: "# hi\n![](attachments/pitch/post-slug/01.jpg)",
+        result_title: "Hi",
+        result_slug: "post-slug",
+        result_attachments: [
+          { filename: "01.jpg", base64: "AAAA" },
+          { filename: "02.jpg", base64: "BBBB" },
+        ],
+      }),
+    ]);
+    const app = fakeApp();
+    const tracker = new JobTracker({
+      app,
+      client,
+      settings: {
+        serverUrl: "x",
+        apiKey: "k",
+        outputFolder: "notes",
+        pollIntervalMs: 1,
+        pollTimeoutMs: 10_000,
+      },
+    });
+    tracker.track("j", "test");
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(app.createdBinary).toHaveLength(2);
+    expect(app.createdBinary[0].path).toBe("notes/attachments/pitch/post-slug/01.jpg");
+    expect(app.createdBinary[1].path).toBe("notes/attachments/pitch/post-slug/02.jpg");
+    expect(app.created).toHaveLength(1);
+    expect(app.created[0].data).toContain("![](attachments/pitch/post-slug/01.jpg)");
+    expect(app.folders).toContain("notes/attachments/pitch/post-slug");
+  });
+});
+
+describe("formatElapsed", () => {
+  test("under a minute", () => {
+    expect(formatElapsed(0, 5_000)).toBe("5s");
+    expect(formatElapsed(0, 59_999)).toBe("59s");
+  });
+  test("over a minute", () => {
+    expect(formatElapsed(0, 60_000)).toBe("1m");
+    expect(formatElapsed(0, 83_000)).toBe("1m 23s");
   });
 });

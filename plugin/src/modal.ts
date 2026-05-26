@@ -1,17 +1,22 @@
 import { App, Modal, Notice, Setting } from "obsidian";
 
 import { ApiError, AuthError, PitchClient } from "./api";
-import { JobTracker } from "./job-tracker";
+import { ActiveJob, formatElapsed, JobTracker } from "./job-tracker";
 
 /**
- * Submit a URL, then close. Polling continues in the background via JobTracker;
- * the user sees an Obsidian Notice when the note lands or fails. The modal does
- * NOT block Obsidian or stay open through processing.
+ * Submit a URL, then close. Polling continues in the background via JobTracker.
+ *
+ * If there are jobs already running when this modal opens, show them at the top
+ * with live status — this is how the user knows something is in flight without
+ * needing a permanent status-bar widget.
  */
 export class IngestUrlModal extends Modal {
   private url = "";
   private topicHint = "";
   private submitting = false;
+  private statusEl: HTMLElement | null = null;
+  private refreshInterval: number | null = null;
+  private unsubscribe: (() => void) | null = null;
 
   constructor(
     app: App,
@@ -24,6 +29,13 @@ export class IngestUrlModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     contentEl.createEl("h2", { text: "Pitch: Ingest URL" });
+
+    // Status panel — only renders when there's something to show.
+    this.statusEl = contentEl.createEl("div", { cls: "pitch-status-panel" });
+    this.renderStatus();
+    this.unsubscribe = this.tracker.onChange(() => this.renderStatus());
+    // Tick every second so elapsed times update while modal is open.
+    this.refreshInterval = window.setInterval(() => this.renderStatus(), 1000);
 
     new Setting(contentEl)
       .setName("Video URL")
@@ -60,6 +72,33 @@ export class IngestUrlModal extends Modal {
     });
   }
 
+  private renderStatus(): void {
+    if (!this.statusEl) return;
+    const jobs = this.tracker.getActive();
+    this.statusEl.empty();
+    if (jobs.length === 0) return;
+
+    this.statusEl.createEl("div", {
+      cls: "pitch-status-header",
+      text: `Active jobs (${jobs.length})`,
+    });
+    const list = this.statusEl.createEl("ul", { cls: "pitch-status-list" });
+    for (const job of jobs) {
+      this.renderJobRow(list, job);
+    }
+  }
+
+  private renderJobRow(parent: HTMLElement, job: ActiveJob): void {
+    const li = parent.createEl("li", { cls: "pitch-status-row" });
+    li.createEl("span", { cls: "pitch-status-label", text: job.label });
+    const stateText = job.message ? `${job.status} — ${job.message}` : job.status;
+    li.createEl("span", { cls: "pitch-status-state", text: stateText });
+    li.createEl("span", {
+      cls: "pitch-status-elapsed",
+      text: formatElapsed(job.startedAt),
+    });
+  }
+
   private async submit() {
     if (this.submitting) return;
     if (!this.url) {
@@ -72,7 +111,7 @@ export class IngestUrlModal extends Modal {
       const sub = await this.client.submitUrl(this.url, this.topicHint || undefined);
       const label = this.shortLabel(this.url);
       this.tracker.track(sub.id, label);
-      new Notice(`Pitch [${label}]: queued (${sub.id.slice(0, 6)}). I'll notify when done.`, 5_000);
+      new Notice(`Pitch [${label}]: queued. I'll notify when done.`, 5_000);
       this.close();
     } catch (e) {
       if (e instanceof AuthError) {
@@ -98,6 +137,14 @@ export class IngestUrlModal extends Modal {
   }
 
   onClose() {
+    if (this.refreshInterval !== null) {
+      window.clearInterval(this.refreshInterval);
+      this.refreshInterval = null;
+    }
+    if (this.unsubscribe) {
+      this.unsubscribe();
+      this.unsubscribe = null;
+    }
     this.contentEl.empty();
   }
 }

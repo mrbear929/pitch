@@ -15,6 +15,11 @@ export type JobStatus =
   | "done"
   | "failed";
 
+export interface Attachment {
+  filename: string;
+  base64: string;
+}
+
 export interface JobView {
   id: string;
   status: JobStatus;
@@ -24,6 +29,7 @@ export interface JobView {
   result_slug: string | null;
   error: string | null;
   user_guidance: string | null;
+  result_attachments: Attachment[];
 }
 
 export interface SubmitResponse {

@@ -22,12 +22,31 @@ class FakeVideoFetcher:
         return bundle
 
 
+_TINY_JPEG = bytes.fromhex(
+    "ffd8ffe000104a46494600010100000100010000ffdb004300080606070605080707070909080a0c140d"
+    "0c0b0b0c1912130f141d1a1f1e1d1a1c1c20242e2720222c231c1c2837292c30313434341f27393d3832"
+    "3c2e333432ffdb0043010909090c0b0c180d0d1832211c2132323232323232323232323232323232323232"
+    "32323232323232323232323232323232323232323232323232323232323232323232ffc00011080001000103"
+    "012200021101031101ffc4001f0000010501010101010100000000000000000102030405060708090a0b"
+    "ffc400b5100002010303020403050504040000017d01020300041105122131410613516107227114328191"
+    "a1082342b1c11552d1f02433627282090a161718191a25262728292a3435363738393a434445464748494a"
+    "535455565758595a636465666768696a737475767778797a838485868788898a92939495969798999aa2a3"
+    "a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9"
+    "eaf1f2f3f4f5f6f7f8f9faffc4001f0100030101010101010101010000000000000102030405060708090a"
+    "0bffc400b51100020102040403040705040400010277000102031104052131061241510761711322328108"
+    "144291a1b1c109233352f0156272d10a162434e125f11718191a262728292a35363738393a434445464748"
+    "494a535455565758595a636465666768696a737475767778797a82838485868788898a92939495969798"
+    "999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae2e3e4e5e6"
+    "e7e8e9eaf2f3f4f5f6f7f8f9faffda000c03010002110311003f00fbfa28a28affd9"
+)
+
+
 class FakeImageFetcher:
     def fetch(self, url, work_dir):
         a = Path(work_dir) / "a.jpg"
         b = Path(work_dir) / "b.jpg"
-        a.write_bytes(b"a")
-        b.write_bytes(b"b")
+        a.write_bytes(_TINY_JPEG)
+        b.write_bytes(_TINY_JPEG)
         return MediaBundle(title="Image Post", image_paths=[a, b])
 
 
@@ -123,7 +142,8 @@ def make_pipeline(**over):
 def test_video_path_runs(tmp_path):
     u = FakeUnderstander()
     p = make_pipeline(understander=u)
-    md, title, slug = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    result = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    md, title, slug = result.markdown, result.title, result.slug
     assert title == "Faked Title"
     assert slug == "faked-title"
     assert "## Summary" in md
@@ -134,21 +154,34 @@ def test_video_path_runs(tmp_path):
     assert u.last_call[:3] == (1, 1, 0)  # 1 transcript seg, 1 frame, 0 images
 
 
-def test_image_path_runs(tmp_path):
+def test_image_carousel_fast_path(tmp_path):
+    """Image-only post hits the fast path: no LLM, just embed images."""
     u = FakeUnderstander()
     p = make_pipeline(
         fetcher=FakeImageFetcher(),
         vision=FakeVision(["pic 1", "pic 2"]),
-        ocr=FakeOcr(["", ""]),
+        ocr=FakeOcr(["nope1", "nope2"]),
         understander=u,
     )
-    md, title, _ = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
-    assert title == "Image Post"
+    result = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    md = result.markdown
+
+    # Title comes from the fetcher; type is image carousel.
+    assert result.title == "Image Post"
     assert "**Type:** image carousel" in md
-    assert "## Image Carousel" in md
-    assert "pic 1" in md and "pic 2" in md
+
+    # Slides are embedded — no Vision/OCR sections.
+    assert "## Slides" in md
+    assert "![](attachments/pitch/" in md
+    assert "## Image Carousel" not in md
     assert "## Transcript" not in md
-    assert u.last_call[:3] == (0, 0, 2)  # no transcript, no frames, 2 images
+
+    # Attachments accompany the markdown for the plugin to write.
+    assert len(result.attachments) == 2
+    assert all(a.filename.endswith(".jpg") for a in result.attachments)
+
+    # Most importantly: the understander never ran.
+    assert u.last_call is None
 
 
 def test_post_text_and_author_threaded(tmp_path):
@@ -168,7 +201,8 @@ def test_post_text_and_author_threaded(tmp_path):
 
     u = FakeUnderstander()
     p = make_pipeline(fetcher=FetcherWithMeta(), understander=u)
-    md, _, _ = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    result = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    md = result.markdown
     assert u.last_call[3] == "The actual post body"
     assert u.last_call[4] == "Some Author"
     # Post body shows up in the rendered note
@@ -177,19 +211,18 @@ def test_post_text_and_author_threaded(tmp_path):
     assert "**Author:** Some Author" in md
 
 
-def test_ocr_cleaner_runs(tmp_path):
-    """Cleaner output replaces raw OCR; vision hint is threaded per image."""
-    cleaner = FakeOcrCleaner(mapping={"$  ls": "$ ls (clean)", "x  y": "xy (clean)"})
+def test_ocr_cleaner_runs_for_video_frames(tmp_path):
+    """Cleaner output replaces raw OCR on video frames; vision hint threaded."""
+    cleaner = FakeOcrCleaner(mapping={"$  ls": "$ ls (clean)"})
     p = make_pipeline(
-        fetcher=FakeImageFetcher(),
-        ocr=FakeOcr(["$  ls", "x  y"]),
-        vision=FakeVision(["v1", "v2"]),
+        # video path uses FakeVideoFetcher, frames via FakeFrames
+        ocr=FakeOcr(["$  ls"]),
+        vision=FakeVision(["v1"]),
         ocr_cleaner=cleaner,
     )
-    md, _, _ = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
-    assert "$ ls (clean)" in md
-    assert "xy (clean)" in md
-    assert cleaner.last_hint == "v2"  # last image's vision hint passed through
+    result = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    assert "$ ls (clean)" in result.markdown
+    assert cleaner.last_hint == "v1"
 
 
 def test_ocr_cleaner_skips_empty_input(tmp_path):
@@ -202,9 +235,8 @@ def test_ocr_cleaner_skips_empty_input(tmp_path):
             return "should-not-appear"
 
     p = make_pipeline(
-        fetcher=FakeImageFetcher(),
-        ocr=FakeOcr(["", ""]),
-        vision=FakeVision(["v1", "v2"]),
+        ocr=FakeOcr([""]),
+        vision=FakeVision(["v"]),
         ocr_cleaner=CountingCleaner(),
     )
     p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
@@ -213,35 +245,40 @@ def test_ocr_cleaner_skips_empty_input(tmp_path):
 
 def test_understander_crash_swallowed(tmp_path):
     p = make_pipeline(understander=CrashingUnderstander())
-    md, _, _ = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    result = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    md = result.markdown
     assert "## Summary" not in md
     assert "## Frame Visuals" in md  # frames still rendered
 
 
 def test_no_understander(tmp_path):
     p = make_pipeline(understander=None)
-    md, _, _ = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    result = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    md = result.markdown
     assert "## Summary" not in md
 
 
 def test_no_vision(tmp_path):
     # No vision = frames still render, just without vision_description
     p = make_pipeline(vision=None)
-    md, _, _ = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    result = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    md = result.markdown
     # OCR text alone is enough to keep the frame visible
     assert "$ ls" in md
 
 
 def test_vision_crash_swallowed(tmp_path):
     p = make_pipeline(vision=CrashingVision())
-    md, _, _ = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    result = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    md = result.markdown
     # Frame is still visible because OCR succeeded
     assert "$ ls" in md
 
 
 def test_ocr_crash_swallowed(tmp_path):
     p = make_pipeline(ocr=CrashingOcr())
-    md, _, _ = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    result = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    md = result.markdown
     # Vision description alone keeps the frame visible
     assert "a terminal" in md
 

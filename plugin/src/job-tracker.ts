@@ -2,8 +2,8 @@
  * Background polling for in-flight Pitch jobs.
  *
  * The modal hands a job off here and closes. JobTracker keeps polling on its
- * own, fires Obsidian Notices on transitions, and writes the note when done.
- * Survives across modal opens/closes; lives for the lifetime of the plugin.
+ * own, fires Obsidian Notices on transitions, and writes the note (plus any
+ * binary attachments) when done. Lives for the lifetime of the plugin.
  */
 import { Notice, TFile } from "obsidian";
 
@@ -13,57 +13,104 @@ import { PitchSettings } from "./settings";
 import { filenameFor } from "./slug";
 import { uniquePath } from "./vault";
 
+export interface ActiveJob {
+  id: string;
+  label: string;
+  status: string;
+  message: string;
+  startedAt: number;
+}
+
 export interface JobTrackerDeps {
-  app: { vault: { getAbstractFileByPath: (p: string) => unknown; create: (p: string, data: string) => Promise<unknown>; createFolder: (p: string) => Promise<unknown> }; workspace: { getLeaf: (newLeaf: boolean) => { openFile: (f: TFile) => Promise<unknown> } } };
+  app: {
+    vault: {
+      getAbstractFileByPath: (p: string) => unknown;
+      create: (p: string, data: string) => Promise<unknown>;
+      createBinary: (p: string, data: ArrayBuffer) => Promise<unknown>;
+      createFolder: (p: string) => Promise<unknown>;
+    };
+    workspace: {
+      getLeaf: (newLeaf: boolean) => { openFile: (f: TFile) => Promise<unknown> };
+    };
+  };
   client: PitchClient;
   settings: PitchSettings;
 }
 
 export class JobTracker {
   private active = new Map<string, AbortController>();
+  private state = new Map<string, ActiveJob>();
+  private listeners = new Set<() => void>();
 
   constructor(private deps: JobTrackerDeps) {}
 
-  /** Returns the count of currently-tracked jobs. Useful for status indicators. */
   get activeCount(): number {
     return this.active.size;
   }
 
-  /**
-   * Track a freshly-submitted job. Non-blocking: returns immediately. Polling
-   * runs in the background; the user is notified by Notice on terminal state.
-   */
+  /** Snapshot of currently in-flight jobs (for the modal status panel). */
+  getActive(): ActiveJob[] {
+    return Array.from(this.state.values()).sort((a, b) => a.startedAt - b.startedAt);
+  }
+
+  /** Subscribe to active-job updates. Returns unsubscribe fn. */
+  onChange(fn: () => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  private notifyChange(): void {
+    for (const fn of this.listeners) {
+      try {
+        fn();
+      } catch {
+        // listener errors don't stop tracking
+      }
+    }
+  }
+
   track(jobId: string, label: string): void {
     if (this.active.has(jobId)) return;
     const ac = new AbortController();
     this.active.set(jobId, ac);
+    this.state.set(jobId, {
+      id: jobId,
+      label,
+      status: "pending",
+      message: "",
+      startedAt: Date.now(),
+    });
+    this.notifyChange();
     this.runInBackground(jobId, label, ac.signal).finally(() => {
       this.active.delete(jobId);
+      this.state.delete(jobId);
+      this.notifyChange();
     });
   }
 
-  /** Cancel polling for a job (does not cancel processing on the server). */
   cancel(jobId: string): void {
     this.active.get(jobId)?.abort();
   }
 
-  /** Cancel everything — call from plugin onunload. */
   cancelAll(): void {
     for (const ac of this.active.values()) ac.abort();
     this.active.clear();
+    this.state.clear();
+    this.notifyChange();
   }
 
   private async runInBackground(jobId: string, label: string, signal: AbortSignal): Promise<void> {
-    let lastStatus = "";
     try {
       const job = await pollUntilDone(this.deps.client, jobId, {
         intervalMs: this.deps.settings.pollIntervalMs,
         timeoutMs: this.deps.settings.pollTimeoutMs,
         onStatus: (j) => {
           if (signal.aborted) return;
-          if (j.status !== lastStatus) {
-            lastStatus = j.status;
-            // Quiet status updates — no notice flood. Could surface in a status bar later.
+          const st = this.state.get(jobId);
+          if (st) {
+            st.status = j.status;
+            st.message = j.progress_message || "";
+            this.notifyChange();
           }
         },
         sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
@@ -93,10 +140,27 @@ export class JobTracker {
     }
     const folder = this.deps.settings.outputFolder;
     await this.ensureFolder(folder);
+
     const filename = filenameFor(job.result_title || "video");
     const path = await uniquePath(folder, filename, async (p) =>
       this.deps.app.vault.getAbstractFileByPath(p) !== null,
     );
+
+    // Save attachments first so the markdown's image refs resolve immediately.
+    if (job.result_attachments && job.result_attachments.length > 0) {
+      const slug = job.result_slug || "post";
+      const attachFolder = `${folder}/attachments/pitch/${slug}`;
+      await this.ensureFolder(`${folder}/attachments`);
+      await this.ensureFolder(`${folder}/attachments/pitch`);
+      await this.ensureFolder(attachFolder);
+      for (const att of job.result_attachments) {
+        const target = `${attachFolder}/${att.filename}`;
+        // Skip if it already exists (rare, but be safe).
+        if (this.deps.app.vault.getAbstractFileByPath(target)) continue;
+        await this.deps.app.vault.createBinary(target, base64ToArrayBuffer(att.base64));
+      }
+    }
+
     const file = (await this.deps.app.vault.create(path, job.result_markdown)) as TFile;
     await this.deps.app.workspace.getLeaf(true).openFile(file);
   }
@@ -104,6 +168,28 @@ export class JobTracker {
   private async ensureFolder(path: string): Promise<void> {
     const existing = this.deps.app.vault.getAbstractFileByPath(path);
     if (existing) return;
-    await this.deps.app.vault.createFolder(path);
+    try {
+      await this.deps.app.vault.createFolder(path);
+    } catch {
+      // Race with another job creating the same folder — ignore.
+    }
   }
+}
+
+function base64ToArrayBuffer(b64: string): ArrayBuffer {
+  const binary = atob(b64);
+  const len = binary.length;
+  const buf = new ArrayBuffer(len);
+  const view = new Uint8Array(buf);
+  for (let i = 0; i < len; i++) view[i] = binary.charCodeAt(i);
+  return buf;
+}
+
+/** Format an elapsed duration as "1m 23s" or "47s". */
+export function formatElapsed(startedAt: number, now: number = Date.now()): string {
+  const s = Math.max(0, Math.floor((now - startedAt) / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return rem ? `${m}m ${rem}s` : `${m}m`;
 }

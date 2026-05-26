@@ -2,7 +2,6 @@ from datetime import datetime, timezone
 
 from worker.render import (
     FrameVisual,
-    ImageVisual,
     LessonInputs,
     TranscriptSegment,
     render_lesson,
@@ -41,12 +40,12 @@ def image_inputs(**over):
         processing_seconds=70.0,
         transcript=[],
         frame_visuals=[],
-        image_visuals=[
-            ImageVisual(index=0, vision_description="A diagram of X."),
-            ImageVisual(index=1, ocr_text="step 2"),
-            ImageVisual(index=2),  # empty, skipped
-        ],
+        image_visuals=[],
         has_video=False,
+        embedded_image_paths=[
+            "attachments/pitch/post-slug/01.jpg",
+            "attachments/pitch/post-slug/02.jpg",
+        ],
     )
     for k, v in over.items():
         setattr(base, k, v)
@@ -73,12 +72,12 @@ def test_image_post_renders():
     assert "**Duration:**" not in md  # no duration line for image-only
     assert "took 1m 10s" in md
     assert "## Transcript" not in md
-    assert "## Image Carousel" in md
-    assert "### Image 1" in md
-    assert "A diagram of X." in md
-    assert "### Image 2" in md
-    assert "step 2" in md
-    assert "### Image 3" not in md  # empty image skipped
+    # Slides embedded as Obsidian-renderable image refs
+    assert "## Slides" in md
+    assert "![](attachments/pitch/post-slug/01.jpg)" in md
+    assert "![](attachments/pitch/post-slug/02.jpg)" in md
+    # The old per-image visual sections are gone — fast path.
+    assert "## Image Carousel" not in md
 
 
 def test_post_metadata_renders():

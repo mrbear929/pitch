@@ -37,6 +37,16 @@ class JobProgress(BaseModel):
     message: Optional[str] = None
 
 
+class Attachment(BaseModel):
+    """A binary file (typically a resized image) the plugin saves into the vault.
+
+    Markdown references these files by relative path; the plugin writes them
+    under <outputFolder>/attachments/<slug>/<filename>.
+    """
+    filename: str       # e.g. "01.jpg"
+    base64: str         # base64-encoded bytes
+
+
 class JobResult(BaseModel):
     """Worker → dispatcher final result."""
     status: JobStatus            # done or failed
@@ -45,6 +55,7 @@ class JobResult(BaseModel):
     slug: Optional[str] = None
     error: Optional[str] = None
     user_guidance: Optional[str] = None  # surfaced verbatim in plugin notice on failure
+    attachments: list[Attachment] = []
 
 
 class Job(BaseModel):
@@ -62,3 +73,4 @@ class Job(BaseModel):
     user_guidance: Optional[str] = None
     claimed_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    result_attachments: list[Attachment] = []

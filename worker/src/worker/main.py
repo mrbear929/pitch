@@ -8,11 +8,11 @@ import sys
 import traceback
 from pathlib import Path
 
-from pitch_shared import JobResult, JobStatus
+from pitch_shared import Attachment, JobResult, JobStatus
 
 from .config import Config
 from .dispatcher_client import DispatcherClient
-from .pipeline import FetchError, Pipeline
+from .pipeline import FetchError, Pipeline, PipelineResult
 from .tools import make_default_pipeline
 
 log = logging.getLogger("pitch.worker")
@@ -54,7 +54,7 @@ async def process_one(client: DispatcherClient, pipeline: Pipeline, config: Conf
             progress_state["message"] = message or ""
 
         try:
-            markdown, title, slug = await asyncio.to_thread(
+            result = await asyncio.to_thread(
                 _run_pipeline_with_progress,
                 pipeline,
                 job.url or "",
@@ -72,9 +72,13 @@ async def process_one(client: DispatcherClient, pipeline: Pipeline, config: Conf
             job.id,
             JobResult(
                 status=JobStatus.done,
-                markdown=markdown,
-                title=title,
-                slug=slug,
+                markdown=result.markdown,
+                title=result.title,
+                slug=result.slug,
+                attachments=[
+                    Attachment(filename=a.filename, base64=a.base64)
+                    for a in result.attachments
+                ],
             ),
         )
         log.info("done job=%s", job.id)
@@ -110,7 +114,7 @@ def _run_pipeline_with_progress(
     job_dir: Path,
     frame_every_seconds: int,
     progress_cb,
-) -> tuple[str, str, str]:
+) -> PipelineResult:
     """Sync wrapper that owns the heavy lifting."""
     return pipeline.run(
         url=url,

@@ -1,1 +1,1 @@
-from .job import Job, JobProgress, JobResult, JobStatus, JobSubmit  # noqa: F401
+from .job import Attachment, Job, JobProgress, JobResult, JobStatus, JobSubmit  # noqa: F401

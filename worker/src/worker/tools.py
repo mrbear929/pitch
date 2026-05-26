@@ -481,31 +481,33 @@ class TesseractOcrRunner(OcrRunner):
 # ---- Understanding (optional, local Ollama) ----
 
 OLLAMA_PROMPT = """\
-You are converting a Chinese/English vibe-coding or tech post into a structured engineering note.
+You are summarizing a video into a single coverage paragraph for a developer's
+knowledge base. The user will read your output to decide whether to watch the
+full video.
 
 You will receive (any may be empty):
-  - POST TEXT: the user's caption (highest-trust signal — use this most).
-  - AUTHOR: the post creator's name.
-  - TRANSCRIPT: spoken audio (may be missing for image-only posts).
-  - FRAME / IMAGE VISUALS: vision-LLM descriptions of what's shown on screen.
-  - OCR: text recognized inside the visuals (cleaned but still imperfect).
+  - POST TEXT: the creator's caption.
+  - AUTHOR: post creator's name.
+  - TRANSCRIPT: spoken audio.
+  - FRAME VISUALS: vision-LLM descriptions of key on-screen moments.
+  - OCR: text recognized inside frames (noisy).
 
-Output VALID JSON only. No prose, no markdown fences. Match the post's
-language: if the post is in Chinese, write summary/key_points in Chinese.
+Output VALID JSON only. No prose, no markdown fences. Match the source's
+language (Chinese → Chinese, English → English).
 
 Schema:
 {
-  "summary": "<2-3 sentence summary of the actual lesson/idea, not a description of the post>",
-  "key_points": ["<actionable bullet, max ~15 words>", ...],
+  "coverage": "<one paragraph (3-6 sentences) describing what this video covers — topics, claims, demonstrations, conclusions. Concrete, not promotional.>",
+  "key_points": ["<short actionable bullet>", ...],
   "tools_mentioned": ["<tool/product name>", ...],
-  "code_snippets": ["<short code or command, exact text>", ...]
+  "code_snippets": ["<short exact code or command shown on screen>", ...]
 }
 
 Rules:
-  - Trust POST TEXT and VISUAL descriptions over OCR. OCR is noisy.
-  - Empty arrays are fine when the content doesn't apply.
+  - The "coverage" should answer: 'what does this video cover?' as if briefing a peer.
+  - Empty arrays are fine when nothing applies.
+  - Do NOT include BGM track names as tools.
   - Always return all four keys.
-  - Do NOT include the BGM track name as a tool.
 
 """
 

@@ -76,6 +76,7 @@ def create_app(config: Optional[Config] = None, store: Optional[JobStore] = None
             slug=payload.slug,
             error=payload.error,
             user_guidance=payload.user_guidance,
+            attachments=payload.attachments,
         )
         if not job:
             raise HTTPException(status_code=404, detail="not found")

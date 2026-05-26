@@ -22,6 +22,7 @@ const partial = (over: Partial<JobView>): JobView => ({
   result_slug: null,
   error: null,
   user_guidance: null,
+  result_attachments: [],
   ...over,
 });
 

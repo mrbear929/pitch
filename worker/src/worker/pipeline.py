@@ -30,6 +30,25 @@ class FetchError(Exception):
 
 
 @dataclass
+class AttachmentOut:
+    """Binary file the plugin should save into the vault.
+
+    Mirrors pitch_shared.Attachment but lives worker-side so test fakes
+    don't have to import pydantic.
+    """
+    filename: str
+    base64: str
+
+
+@dataclass
+class PipelineResult:
+    markdown: str
+    title: str
+    slug: str
+    attachments: list[AttachmentOut] = field(default_factory=list)
+
+
+@dataclass
 class MediaBundle:
     """The output of fetching a URL.
 
@@ -130,14 +149,78 @@ class Pipeline:
         work_dir: Path,
         frame_every_seconds: int,
         progress_cb: ProgressCallback = _noop_progress,
-    ) -> tuple[str, str, str]:
-        """Returns (markdown, title, slug)."""
+    ) -> "PipelineResult":
+        """Returns a PipelineResult: markdown, title, slug, plus optional attachments."""
         import time
 
         start = time.monotonic()
 
         progress_cb(JobStatus.fetching, "downloading media")
         bundle = self.fetcher.fetch(url, work_dir)
+
+        # ---- Branch 1: image-only carousel — fast path, no LLM ----
+        if bundle.image_paths and bundle.video_path is None:
+            return self._run_image_carousel(url, bundle, start, progress_cb)
+
+        # ---- Branch 2: video (or video + images) — full LLM path ----
+        return self._run_video(
+            url, bundle, work_dir, frame_every_seconds, start, progress_cb
+        )
+
+    def _run_image_carousel(
+        self,
+        url: str,
+        bundle: "MediaBundle",
+        start: float,
+        progress_cb: ProgressCallback,
+    ) -> "PipelineResult":
+        """Image carousel = post text + embedded images. No vision, no OCR, no LLM.
+
+        Reasoning: the user can read the slides themselves. Pitch's job is to
+        capture the post into the vault with the original visuals intact.
+        """
+        import time
+
+        progress_cb(JobStatus.rendering, f"saving {len(bundle.image_paths)} image(s)")
+
+        slug = slugify(bundle.title)
+        attachments = self._build_attachments(bundle.image_paths, slug)
+        # Markdown references attachments by relative path under the vault.
+        image_paths_rel = [
+            f"attachments/pitch/{slug}/{a.filename}" for a in attachments
+        ]
+
+        elapsed = time.monotonic() - start
+        inputs = LessonInputs(
+            source_url=url,
+            title=bundle.title,
+            duration_seconds=0.0,
+            processed_at=datetime.now(timezone.utc),
+            processing_seconds=elapsed,
+            post_text=bundle.post_text,
+            author=bundle.author,
+            music_title=bundle.music_title,
+            transcript=[],
+            frame_visuals=[],
+            image_visuals=[],
+            has_video=False,
+            embedded_image_paths=image_paths_rel,
+        )
+        markdown = render_lesson(inputs)
+        return PipelineResult(
+            markdown=markdown, title=bundle.title, slug=slug, attachments=attachments
+        )
+
+    def _run_video(
+        self,
+        url: str,
+        bundle: "MediaBundle",
+        work_dir: Path,
+        frame_every_seconds: int,
+        start: float,
+        progress_cb: ProgressCallback,
+    ) -> "PipelineResult":
+        import time
 
         transcript: list[TranscriptSegment] = []
         frame_visuals: list[FrameVisual] = []
@@ -213,13 +296,59 @@ class Pipeline:
             frame_visuals=frame_visuals,
             image_visuals=image_visuals,
             has_video=bundle.video_path is not None,
+            coverage=understanding.get("coverage"),
             summary=understanding.get("summary"),
             key_points=understanding.get("key_points") or [],
             tools_mentioned=understanding.get("tools_mentioned") or [],
             code_snippets=understanding.get("code_snippets") or [],
         )
         markdown = render_lesson(inputs)
-        return markdown, bundle.title, slugify(bundle.title)
+        return PipelineResult(
+            markdown=markdown,
+            title=bundle.title,
+            slug=slugify(bundle.title),
+            attachments=[],
+        )
+
+    def _build_attachments(
+        self, image_paths: list[Path], slug: str
+    ) -> list["AttachmentOut"]:
+        """Resize images to 1280px long-edge, JPEG-encode, base64-wrap."""
+        import base64
+        from io import BytesIO
+
+        try:
+            from PIL import Image
+        except ImportError:
+            Image = None
+
+        out: list[AttachmentOut] = []
+        for i, p in enumerate(image_paths):
+            try:
+                if Image is not None:
+                    img = Image.open(p)
+                    if img.mode not in ("RGB", "L"):
+                        img = img.convert("RGB")
+                    long_edge = max(img.size)
+                    if long_edge > 1280:
+                        scale = 1280 / long_edge
+                        new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
+                        img = img.resize(new_size, Image.LANCZOS)
+                    buf = BytesIO()
+                    img.save(buf, format="JPEG", quality=85)
+                    raw = buf.getvalue()
+                else:
+                    raw = p.read_bytes()
+            except Exception:
+                log.exception("attachment encode failed for %s", p)
+                continue
+            out.append(
+                AttachmentOut(
+                    filename=f"{i + 1:02d}.jpg",
+                    base64=base64.b64encode(raw).decode("ascii"),
+                )
+            )
+        return out
 
     def _safe_ocr(self, image_path: Path) -> str:
         try:

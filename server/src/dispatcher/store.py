@@ -119,6 +119,7 @@ class JobStore:
         slug: Optional[str],
         error: Optional[str],
         user_guidance: Optional[str],
+        attachments: Optional[list] = None,
     ) -> Optional[Job]:
         with self._lock, self._conn() as c:
             row = c.execute(
@@ -134,6 +135,8 @@ class JobStore:
             job.error = error
             job.user_guidance = user_guidance
             job.completed_at = datetime.now(timezone.utc)
+            if attachments is not None:
+                job.result_attachments = attachments
             c.execute(
                 "UPDATE jobs SET payload = ?, status = ? WHERE id = ?",
                 (job.model_dump_json(), status.value, job_id),

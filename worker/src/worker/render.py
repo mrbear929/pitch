@@ -51,6 +51,12 @@ class LessonInputs:
     post_text: str = ""
     author: str = ""
     music_title: str = ""
+    # For image-carousel posts: vault-relative paths the markdown will reference
+    # via Obsidian's ![](path) syntax. Empty for video-only posts.
+    embedded_image_paths: list[str] = field(default_factory=list)
+    # For videos: a one-paragraph "what does this video cover" description.
+    coverage: Optional[str] = None
+    # Legacy summary/key_points/etc. used by video path; image carousels skip these.
     summary: Optional[str] = None
     key_points: list[str] = field(default_factory=list)
     tools_mentioned: list[str] = field(default_factory=list)
@@ -85,6 +91,12 @@ _TEMPLATE = """\
 {{ post_text }}
 
 {% endif -%}
+{% if coverage -%}
+## What this covers
+
+{{ coverage }}
+
+{% endif -%}
 {% if summary -%}
 ## Summary
 
@@ -109,6 +121,14 @@ _TEMPLATE = """\
 {% for s in code_snippets %}```
 {{ s }}
 ```
+
+{% endfor -%}
+{% endif -%}
+{% if embedded_image_paths -%}
+## Slides
+
+{% for p in embedded_image_paths -%}
+![]({{ p }})
 
 {% endfor -%}
 {% endif -%}
@@ -138,24 +158,6 @@ _TEMPLATE = """\
 {% endif -%}
 {% endfor -%}
 {% endif -%}
-{% if visible_images -%}
-## Image Carousel
-
-{% for img in visible_images -%}
-### Image {{ img.index + 1 }}
-{% if img.vision_description -%}
-{{ img.vision_description }}
-
-{% endif -%}
-{% if img.ocr_text -%}
-**Text in image:**
-```
-{{ img.ocr_text }}
-```
-
-{% endif -%}
-{% endfor -%}
-{% endif -%}
 """
 
 
@@ -165,11 +167,6 @@ def render_lesson(inputs: LessonInputs) -> str:
     template = env.from_string(_TEMPLATE)
     visible_frames = [
         f for f in inputs.frame_visuals if f.ocr_text.strip() or f.vision_description.strip()
-    ]
-    visible_images = [
-        img
-        for img in inputs.image_visuals
-        if img.ocr_text.strip() or img.vision_description.strip()
     ]
     media_type = (
         "video + images"
@@ -189,11 +186,12 @@ def render_lesson(inputs: LessonInputs) -> str:
         media_type=media_type,
         music_title=inputs.music_title,
         post_text=inputs.post_text,
+        coverage=inputs.coverage,
         summary=inputs.summary,
         key_points=inputs.key_points,
         tools_mentioned=inputs.tools_mentioned,
         code_snippets=inputs.code_snippets,
         transcript=inputs.transcript,
         visible_frames=visible_frames,
-        visible_images=visible_images,
+        embedded_image_paths=inputs.embedded_image_paths,
     )

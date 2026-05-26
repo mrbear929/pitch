@@ -85,11 +85,12 @@ def test_post_metadata_renders():
         image_inputs(
             post_text="The user-typed caption.\nWith two lines.",
             author="AI大刘",
-            music_title="某BGM",
+            music_title="某BGM",  # set on the dataclass, but not surfaced in note
         )
     )
     assert "**Author:** AI大刘" in md
-    assert "**BGM:** 某BGM" in md
+    assert "BGM" not in md  # explicitly suppressed per Bear's preference
+    assert "某BGM" not in md
     assert "## Post" in md
     assert "The user-typed caption." in md
     assert "With two lines." in md

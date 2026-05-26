@@ -82,9 +82,7 @@ _TEMPLATE = """\
 {% endif -%}
 - **Type:** {{ media_type }}
 - **Processed:** {{ processed_at }} (took {{ processing_time }})
-{% if music_title -%}
-- **BGM:** {{ music_title }}
-{% endif %}
+
 {% if post_text -%}
 ## Post
 
@@ -184,7 +182,6 @@ def render_lesson(inputs: LessonInputs) -> str:
         processing_time=_format_processing_time(inputs.processing_seconds),
         has_video=inputs.has_video,
         media_type=media_type,
-        music_title=inputs.music_title,
         post_text=inputs.post_text,
         coverage=inputs.coverage,
         summary=inputs.summary,

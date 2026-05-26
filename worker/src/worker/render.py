@@ -22,16 +22,18 @@ class FrameVisual:
     """A sampled video frame with what we know about it."""
 
     timestamp: float
-    ocr_text: str = ""           # may be empty
-    vision_description: str = "" # may be empty
+    ocr_text: str = ""           # cleaned OCR (legible)
+    ocr_text_raw: str = ""       # original Tesseract output (preserved for debug)
+    vision_description: str = ""
 
 
 @dataclass
 class ImageVisual:
     """A single image from a carousel post."""
 
-    index: int                   # 1-based for humans, 0-based on the wire
+    index: int                   # 0-based
     ocr_text: str = ""
+    ocr_text_raw: str = ""
     vision_description: str = ""
 
 
@@ -41,26 +43,48 @@ class LessonInputs:
     title: str
     duration_seconds: float
     processed_at: datetime
+    processing_seconds: float
     transcript: list[TranscriptSegment]
     frame_visuals: list[FrameVisual]
     image_visuals: list[ImageVisual]
     has_video: bool
+    post_text: str = ""
+    author: str = ""
+    music_title: str = ""
     summary: Optional[str] = None
     key_points: list[str] = field(default_factory=list)
     tools_mentioned: list[str] = field(default_factory=list)
     code_snippets: list[str] = field(default_factory=list)
 
 
+def _format_processing_time(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    m, s = divmod(int(seconds), 60)
+    return f"{m}m {s}s" if s else f"{m}m"
+
+
 _TEMPLATE = """\
 # {{ title }}
 
 - **URL:** {{ source_url }}
+{% if author -%}
+- **Author:** {{ author }}
+{% endif -%}
 {% if has_video -%}
 - **Duration:** {{ duration }}
 {% endif -%}
-- **Processed:** {{ processed_at }}
 - **Type:** {{ media_type }}
+- **Processed:** {{ processed_at }} (took {{ processing_time }})
+{% if music_title -%}
+- **BGM:** {{ music_title }}
+{% endif %}
+{% if post_text -%}
+## Post
 
+{{ post_text }}
+
+{% endif -%}
 {% if summary -%}
 ## Summary
 
@@ -106,7 +130,7 @@ _TEMPLATE = """\
 
 {% endif -%}
 {% if f.ocr_text -%}
-**OCR:**
+**Text in frame:**
 ```
 {{ f.ocr_text }}
 ```
@@ -124,7 +148,7 @@ _TEMPLATE = """\
 
 {% endif -%}
 {% if img.ocr_text -%}
-**OCR:**
+**Text in image:**
 ```
 {{ img.ocr_text }}
 ```
@@ -139,9 +163,13 @@ def render_lesson(inputs: LessonInputs) -> str:
     env = Environment(undefined=StrictUndefined, trim_blocks=False, lstrip_blocks=False)
     env.globals["format_ts"] = format_ts
     template = env.from_string(_TEMPLATE)
-    visible_frames = [f for f in inputs.frame_visuals if f.ocr_text.strip() or f.vision_description.strip()]
+    visible_frames = [
+        f for f in inputs.frame_visuals if f.ocr_text.strip() or f.vision_description.strip()
+    ]
     visible_images = [
-        img for img in inputs.image_visuals if img.ocr_text.strip() or img.vision_description.strip()
+        img
+        for img in inputs.image_visuals
+        if img.ocr_text.strip() or img.vision_description.strip()
     ]
     media_type = (
         "video + images"
@@ -153,10 +181,14 @@ def render_lesson(inputs: LessonInputs) -> str:
     return template.render(
         title=inputs.title,
         source_url=inputs.source_url,
+        author=inputs.author,
         duration=format_ts(inputs.duration_seconds),
         processed_at=inputs.processed_at.strftime("%Y-%m-%d %H:%M %Z").strip(),
+        processing_time=_format_processing_time(inputs.processing_seconds),
         has_video=inputs.has_video,
         media_type=media_type,
+        music_title=inputs.music_title,
+        post_text=inputs.post_text,
         summary=inputs.summary,
         key_points=inputs.key_points,
         tools_mentioned=inputs.tools_mentioned,

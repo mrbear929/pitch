@@ -17,12 +17,14 @@ from .pipeline import (
     Fetcher,
     FrameSampler,
     MediaBundle,
+    OcrCleaner,
     OcrRunner,
     Transcriber,
     Understander,
     VisionAnalyzer,
 )
 from .render import FrameVisual, ImageVisual, TranscriptSegment
+from .text import format_ts
 
 log = logging.getLogger(__name__)
 
@@ -116,12 +118,23 @@ class DouyinFetcher(Fetcher):
                 "private, or the share-page format may have changed.",
             )
 
-        title = info.get("title") or f"douyin-{aweme_id}"
+        post_text = (info.get("desc") or "").strip()
+        music_title = (info.get("music_title") or "").strip()
+        author = (info.get("author") or "").strip()
+
+        # Title preference: post desc (first line, truncated) > author > music.
+        title = self._title_from(post_text, author, music_title, aweme_id)
 
         # Image-carousel post.
         if info.get("image_urls"):
             image_paths = self._download_images(info["image_urls"], aweme_id, work_dir)
-            return MediaBundle(title=title, image_paths=image_paths)
+            return MediaBundle(
+                title=title,
+                image_paths=image_paths,
+                post_text=post_text,
+                author=author,
+                music_title=music_title,
+            )
 
         # Video post.
         if info.get("play_url"):
@@ -130,12 +143,35 @@ class DouyinFetcher(Fetcher):
                 title=title,
                 video_path=video_path,
                 duration_seconds=float(info.get("duration") or 0.0),
+                post_text=post_text,
+                author=author,
+                music_title=music_title,
             )
 
         raise FetchError(
             "DouyinFetcher: share page parsed but no media found",
             "Douyin returned a response we couldn't classify as video or images.",
         )
+
+    @staticmethod
+    def _title_from(post_text: str, author: str, music_title: str, aweme_id: str) -> str:
+        """Pick the best human-meaningful title for the note.
+
+        Order: first-line of post text → music → author → fallback.
+        Strips Douyin's hashtag-spam tail (#tag1 #tag2 ...) so a 200-char post
+        doesn't drag a wall of tags into the filename.
+        """
+        if post_text:
+            first_line = post_text.splitlines()[0].strip()
+            # Drop trailing hashtag spam.
+            first_line = re.sub(r"\s*#\S+(\s+#\S+)*\s*$", "", first_line).strip()
+            if first_line:
+                return first_line[:80]
+        if music_title:
+            return music_title
+        if author:
+            return f"{author} 的帖子"
+        return f"douyin-{aweme_id}"
 
     def _download_video(self, play_url: str, aweme_id: str, work_dir: Path) -> Path:
         media_path = work_dir / f"{aweme_id}.mp4"
@@ -183,22 +219,41 @@ class DouyinFetcher(Fetcher):
 
     @staticmethod
     def _parse_share_html(html: str) -> dict | None:
-        # The HTML embeds a JSON island whose strings use \uXXXX escapes for CJK.
-        # We unescape with json.loads on quoted-string fragments to round-trip
-        # the codepoints correctly.
-        title_m = re.search(r'"title":\s*("(?:[^"\\]|\\.){1,400}")', html)
-        title = json.loads(title_m.group(1)) if title_m else None
+        """Extract the fields we care about from the share-page JSON island.
+
+        The HTML embeds JSON whose strings use \\uXXXX escapes for CJK; we
+        round-trip via json.loads on quoted-string fragments so codepoints
+        come out correctly.
+        """
+        # 1) Post description (the actual user-typed caption).
+        desc = DouyinFetcher._unescape(
+            re.search(r'"desc":\s*("(?:[^"\\]|\\.){1,2000}")', html)
+        )
+
+        # 2) Author display name. The author block is a nested object; we look
+        #    for the *first* nickname field, which belongs to the post author
+        #    (later nicknames belong to commenters).
+        author = DouyinFetcher._unescape(
+            re.search(r'"author":\{[^}]{0,2000}?"nickname":\s*("(?:[^"\\]|\\.){1,200}")', html)
+        )
+
+        # 3) Music / BGM title — what we used to mistakenly call the post title.
+        music_title = DouyinFetcher._unescape(
+            re.search(r'"music":\{[^}]{0,2000}?"title":\s*("(?:[^"\\]|\\.){1,400}")', html)
+        )
 
         # Detect image-carousel posts (aweme_type=2).
         aweme_type_m = re.search(r'"aweme_type":(\d+)', html)
         is_images = bool(aweme_type_m) and aweme_type_m.group(1) == "2"
 
+        out: dict = {"desc": desc, "author": author, "music_title": music_title}
+
         if is_images:
             image_urls = DouyinFetcher._parse_image_urls(html)
             if image_urls:
-                return {"title": title, "image_urls": image_urls}
-            # Fall through — sometimes posts marked aweme_type=2 still have a
-            # video. Try the video path before giving up.
+                out["image_urls"] = image_urls
+                return out
+            # Fall through — some aweme_type=2 posts still have a video.
 
         dur_m = re.search(r'"duration":(\d+)', html)
         duration = int(dur_m.group(1)) / 1000.0 if dur_m else 0.0
@@ -212,13 +267,21 @@ class DouyinFetcher(Fetcher):
             list_blob = url_m.group(1)
             play_url_m = re.search(r'"(https[^"]+)"', list_blob)
             if play_url_m:
-                play_url = json.loads('"' + play_url_m.group(1) + '"')
-                return {
-                    "title": title,
-                    "play_url": play_url,
-                    "duration": duration,
-                }
-        return None
+                out["play_url"] = json.loads('"' + play_url_m.group(1) + '"')
+                out["duration"] = duration
+                return out
+        return None if not desc else out
+
+    @staticmethod
+    def _unescape(m: re.Match | None) -> str:
+        """Helper: take an re.Match whose group(1) is a JSON-quoted string and
+        return the raw Python string. Returns "" for None or parse failures."""
+        if not m:
+            return ""
+        try:
+            return json.loads(m.group(1))
+        except (ValueError, json.JSONDecodeError):
+            return ""
 
     @staticmethod
     def _parse_image_urls(html: str) -> list[str]:
@@ -418,21 +481,31 @@ class TesseractOcrRunner(OcrRunner):
 # ---- Understanding (optional, local Ollama) ----
 
 OLLAMA_PROMPT = """\
-You are converting a vibe-coding/tech post into a structured engineering note.
-You will receive: a spoken transcript (may be empty for image-only posts),
-visual descriptions of key frames or carousel images, and OCR text.
+You are converting a Chinese/English vibe-coding or tech post into a structured engineering note.
 
-Output VALID JSON only. No prose, no markdown fences.
+You will receive (any may be empty):
+  - POST TEXT: the user's caption (highest-trust signal — use this most).
+  - AUTHOR: the post creator's name.
+  - TRANSCRIPT: spoken audio (may be missing for image-only posts).
+  - FRAME / IMAGE VISUALS: vision-LLM descriptions of what's shown on screen.
+  - OCR: text recognized inside the visuals (cleaned but still imperfect).
+
+Output VALID JSON only. No prose, no markdown fences. Match the post's
+language: if the post is in Chinese, write summary/key_points in Chinese.
 
 Schema:
 {
-  "summary": "<2-3 sentence summary>",
-  "key_points": ["<bullet>", ...],
-  "tools_mentioned": ["<name>", ...],
+  "summary": "<2-3 sentence summary of the actual lesson/idea, not a description of the post>",
+  "key_points": ["<actionable bullet, max ~15 words>", ...],
+  "tools_mentioned": ["<tool/product name>", ...],
   "code_snippets": ["<short code or command, exact text>", ...]
 }
 
-If the content is sparse, use empty arrays. Always return all four keys.
+Rules:
+  - Trust POST TEXT and VISUAL descriptions over OCR. OCR is noisy.
+  - Empty arrays are fine when the content doesn't apply.
+  - Always return all four keys.
+  - Do NOT include the BGM track name as a tool.
 
 """
 
@@ -447,18 +520,24 @@ class OllamaUnderstander(Understander):
         transcript: list[TranscriptSegment],
         frame_visuals: list[FrameVisual],
         image_visuals: list[ImageVisual],
+        post_text: str = "",
+        author: str = "",
     ) -> dict:
         transcript_text = "\n".join(seg.text for seg in transcript)[:10000]
         frame_text = "\n\n".join(self._frame_block(f) for f in frame_visuals)[:6000]
         image_text = "\n\n".join(self._image_block(i) for i in image_visuals)[:6000]
 
         prompt_parts = [OLLAMA_PROMPT]
+        if post_text:
+            prompt_parts.append("POST TEXT:\n" + post_text[:2000])
+        if author:
+            prompt_parts.append("AUTHOR: " + author)
         if transcript_text:
             prompt_parts.append("TRANSCRIPT:\n" + transcript_text)
-        if frame_text:
-            prompt_parts.append("FRAME VISUALS:\n" + frame_text)
         if image_text:
             prompt_parts.append("CAROUSEL IMAGES:\n" + image_text)
+        if frame_text:
+            prompt_parts.append("FRAME VISUALS:\n" + frame_text)
         prompt = "\n\n".join(prompt_parts)
 
         try:
@@ -482,7 +561,7 @@ class OllamaUnderstander(Understander):
 
     @staticmethod
     def _frame_block(f: FrameVisual) -> str:
-        ts = format_ts(f.timestamp)  # noqa: F821 — provided below
+        ts = format_ts(f.timestamp)
         parts = [f"[{ts}]"]
         if f.vision_description:
             parts.append("vision: " + f.vision_description)
@@ -597,8 +676,63 @@ class OllamaVisionAnalyzer(VisionAnalyzer):
         return base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-# Re-export format_ts for OllamaUnderstander._frame_block.
-from .text import format_ts  # noqa: E402
+# ---- OCR cleanup (text-only LLM pass) ----
+
+OCR_CLEAN_PROMPT = """\
+You are fixing garbled OCR text from a screenshot. Rules:
+  - Preserve every character that looks intentional.
+  - Remove spurious spaces inside Chinese/Japanese/Korean words and numbers.
+  - Fix obvious OCR confusions (e.g. "Al" vs "AI", "0" vs "O") only when the
+    surrounding context makes the correct reading obvious.
+  - Preserve line breaks, lists, code blocks, and punctuation as-is.
+  - Do NOT translate. Do NOT summarize. Do NOT add commentary.
+  - Output ONLY the cleaned text. No prose. No markdown fences.
+
+Vision context (what the image actually shows): {vision_hint}
+
+Garbled OCR:
+---
+{raw_ocr}
+---
+
+Cleaned:"""
+
+
+class OllamaOcrCleaner(OcrCleaner):
+    def __init__(self, base_url: str, model: str) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+
+    def clean(self, raw_ocr: str, vision_hint: str = "") -> str:
+        if len(raw_ocr.strip()) < 4:
+            return raw_ocr
+        prompt = OCR_CLEAN_PROMPT.format(
+            vision_hint=vision_hint or "(none)",
+            raw_ocr=raw_ocr[:4000],
+        )
+        try:
+            with httpx.Client(timeout=180.0) as c:
+                r = c.post(
+                    f"{self.base_url}/api/generate",
+                    json={
+                        "model": self.model,
+                        "prompt": prompt,
+                        "stream": False,
+                        "keep_alive": "30m",
+                    },
+                )
+            r.raise_for_status()
+            body = r.json()
+            cleaned = (body.get("response") or "").strip()
+            # Strip the model's tendency to wrap in code fences or repeat the
+            # "Cleaned:" header even when told not to.
+            cleaned = re.sub(r"^```[a-z]*\n?", "", cleaned, count=1)
+            cleaned = re.sub(r"\n?```\s*$", "", cleaned, count=1)
+            cleaned = re.sub(r"^Cleaned:\s*", "", cleaned, count=1)
+            return cleaned.strip() or raw_ocr
+        except Exception as e:
+            log.warning("ocr cleaner failed: %s", e)
+            return raw_ocr
 
 
 def make_default_pipeline(config):  # noqa: ANN001
@@ -608,6 +742,7 @@ def make_default_pipeline(config):  # noqa: ANN001
     vision = (
         OllamaVisionAnalyzer(config.ollama_url, vision_model) if vision_model else None
     )
+    text_model = config.ollama_model
     return Pipeline(
         fetcher=CompositeFetcher([DouyinFetcher(), YtDlpFetcher()]),
         audio=FfmpegAudioExtractor(),
@@ -615,5 +750,6 @@ def make_default_pipeline(config):  # noqa: ANN001
         frames=FfmpegFrameSampler(),
         ocr=TesseractOcrRunner(),
         vision=vision,
-        understander=OllamaUnderstander(config.ollama_url, config.ollama_model),
+        understander=OllamaUnderstander(config.ollama_url, text_model),
+        ocr_cleaner=OllamaOcrCleaner(config.ollama_url, text_model),
     )

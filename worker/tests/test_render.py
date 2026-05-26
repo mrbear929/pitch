@@ -15,6 +15,7 @@ def video_inputs(**over):
         title="Test Video",
         duration_seconds=125,
         processed_at=datetime(2026, 5, 25, 10, 30, tzinfo=timezone.utc),
+        processing_seconds=42.0,
         transcript=[
             TranscriptSegment(start=0.0, end=2.0, text="Hello"),
             TranscriptSegment(start=2.0, end=4.0, text="world"),
@@ -37,6 +38,7 @@ def image_inputs(**over):
         title="Image Post",
         duration_seconds=0,
         processed_at=datetime(2026, 5, 25, 10, 30, tzinfo=timezone.utc),
+        processing_seconds=70.0,
         transcript=[],
         frame_visuals=[],
         image_visuals=[
@@ -56,6 +58,7 @@ def test_video_renders():
     assert "# Test Video" in md
     assert "**Duration:** 02:05" in md
     assert "**Type:** video" in md
+    assert "took 42s" in md  # processing time
     assert "## Transcript" in md
     assert "`[00:00]` Hello" in md
     assert "## Frame Visuals" in md
@@ -68,6 +71,7 @@ def test_image_post_renders():
     assert "# Image Post" in md
     assert "**Type:** image carousel" in md
     assert "**Duration:**" not in md  # no duration line for image-only
+    assert "took 1m 10s" in md
     assert "## Transcript" not in md
     assert "## Image Carousel" in md
     assert "### Image 1" in md
@@ -75,6 +79,21 @@ def test_image_post_renders():
     assert "### Image 2" in md
     assert "step 2" in md
     assert "### Image 3" not in md  # empty image skipped
+
+
+def test_post_metadata_renders():
+    md = render_lesson(
+        image_inputs(
+            post_text="The user-typed caption.\nWith two lines.",
+            author="AI大刘",
+            music_title="某BGM",
+        )
+    )
+    assert "**Author:** AI大刘" in md
+    assert "**BGM:** 某BGM" in md
+    assert "## Post" in md
+    assert "The user-typed caption." in md
+    assert "With two lines." in md
 
 
 def test_understanding_sections():

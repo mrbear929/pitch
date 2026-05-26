@@ -85,14 +85,24 @@ class FakeUnderstander:
     def __init__(self):
         self.last_call = None
 
-    def understand(self, transcript, frames, images):
-        self.last_call = (len(transcript), len(frames), len(images))
+    def understand(self, transcript, frames, images, post_text="", author=""):
+        self.last_call = (len(transcript), len(frames), len(images), post_text, author)
         return {"summary": "ok", "key_points": [], "tools_mentioned": [], "code_snippets": []}
 
 
 class CrashingUnderstander:
-    def understand(self, transcript, frames, images):
+    def understand(self, transcript, frames, images, post_text="", author=""):
         raise RuntimeError("ollama down")
+
+
+class FakeOcrCleaner:
+    def __init__(self, mapping=None):
+        self.mapping = mapping or {}
+        self.last_hint = None
+
+    def clean(self, raw_ocr, vision_hint=""):
+        self.last_hint = vision_hint
+        return self.mapping.get(raw_ocr, raw_ocr.replace(" ", ""))
 
 
 def make_pipeline(**over):
@@ -104,6 +114,7 @@ def make_pipeline(**over):
         ocr=FakeOcr(["$ ls"]),
         vision=FakeVision(["a terminal"]),
         understander=FakeUnderstander(),
+        ocr_cleaner=None,
     )
     base.update(over)
     return Pipeline(**base)
@@ -119,7 +130,8 @@ def test_video_path_runs(tmp_path):
     assert "## Frame Visuals" in md
     assert "$ ls" in md
     assert "a terminal" in md
-    assert u.last_call == (1, 1, 0)  # 1 transcript seg, 1 frame, 0 images
+    assert "took" in md  # processing time line
+    assert u.last_call[:3] == (1, 1, 0)  # 1 transcript seg, 1 frame, 0 images
 
 
 def test_image_path_runs(tmp_path):
@@ -136,7 +148,67 @@ def test_image_path_runs(tmp_path):
     assert "## Image Carousel" in md
     assert "pic 1" in md and "pic 2" in md
     assert "## Transcript" not in md
-    assert u.last_call == (0, 0, 2)  # no transcript, no frames, 2 images
+    assert u.last_call[:3] == (0, 0, 2)  # no transcript, no frames, 2 images
+
+
+def test_post_text_and_author_threaded(tmp_path):
+    """Bundle.post_text and bundle.author flow through to the understander."""
+
+    class FetcherWithMeta:
+        def fetch(self, url, work_dir):
+            v = Path(work_dir) / "v.mp4"
+            v.write_bytes(b"")
+            return MediaBundle(
+                title="T",
+                video_path=v,
+                duration_seconds=10,
+                post_text="The actual post body",
+                author="Some Author",
+            )
+
+    u = FakeUnderstander()
+    p = make_pipeline(fetcher=FetcherWithMeta(), understander=u)
+    md, _, _ = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    assert u.last_call[3] == "The actual post body"
+    assert u.last_call[4] == "Some Author"
+    # Post body shows up in the rendered note
+    assert "## Post" in md
+    assert "The actual post body" in md
+    assert "**Author:** Some Author" in md
+
+
+def test_ocr_cleaner_runs(tmp_path):
+    """Cleaner output replaces raw OCR; vision hint is threaded per image."""
+    cleaner = FakeOcrCleaner(mapping={"$  ls": "$ ls (clean)", "x  y": "xy (clean)"})
+    p = make_pipeline(
+        fetcher=FakeImageFetcher(),
+        ocr=FakeOcr(["$  ls", "x  y"]),
+        vision=FakeVision(["v1", "v2"]),
+        ocr_cleaner=cleaner,
+    )
+    md, _, _ = p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    assert "$ ls (clean)" in md
+    assert "xy (clean)" in md
+    assert cleaner.last_hint == "v2"  # last image's vision hint passed through
+
+
+def test_ocr_cleaner_skips_empty_input(tmp_path):
+    """Empty raw OCR short-circuits before the cleaner runs."""
+    called = {"n": 0}
+
+    class CountingCleaner:
+        def clean(self, raw_ocr, vision_hint=""):
+            called["n"] += 1
+            return "should-not-appear"
+
+    p = make_pipeline(
+        fetcher=FakeImageFetcher(),
+        ocr=FakeOcr(["", ""]),
+        vision=FakeVision(["v1", "v2"]),
+        ocr_cleaner=CountingCleaner(),
+    )
+    p.run(url="https://x", work_dir=tmp_path, frame_every_seconds=10)
+    assert called["n"] == 0
 
 
 def test_understander_crash_swallowed(tmp_path):

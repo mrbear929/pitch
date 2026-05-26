@@ -5,12 +5,20 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Protocol
+from typing import Callable, Optional, Protocol
+
+from pitch_shared import JobStatus
 
 from .render import FrameVisual, ImageVisual, LessonInputs, TranscriptSegment, render_lesson
 from .text import slugify
 
 log = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[JobStatus, Optional[str]], None]
+
+
+def _noop_progress(_status: JobStatus, _message: Optional[str]) -> None:
+    pass
 
 
 class FetchError(Exception):
@@ -94,8 +102,16 @@ class Pipeline:
     vision: Optional[VisionAnalyzer]
     understander: Optional[Understander]
 
-    def run(self, *, url: str, work_dir: Path, frame_every_seconds: int) -> tuple[str, str, str]:
+    def run(
+        self,
+        *,
+        url: str,
+        work_dir: Path,
+        frame_every_seconds: int,
+        progress_cb: ProgressCallback = _noop_progress,
+    ) -> tuple[str, str, str]:
         """Returns (markdown, title, slug)."""
+        progress_cb(JobStatus.fetching, "downloading media")
         bundle = self.fetcher.fetch(url, work_dir)
 
         transcript: list[TranscriptSegment] = []
@@ -103,10 +119,15 @@ class Pipeline:
         image_visuals: list[ImageVisual] = []
 
         if bundle.video_path is not None:
+            progress_cb(JobStatus.transcribing, "extracting audio")
             audio_path = self.audio.extract(bundle.video_path, work_dir)
+            progress_cb(JobStatus.transcribing, "running whisper")
             transcript = self.transcriber.transcribe(audio_path)
+            progress_cb(JobStatus.extracting, "sampling frames")
             frame_pairs = self.frames.sample(bundle.video_path, work_dir, frame_every_seconds)
-            for ts, p in frame_pairs:
+            total = len(frame_pairs)
+            for i, (ts, p) in enumerate(frame_pairs, 1):
+                progress_cb(JobStatus.extracting, f"frame {i}/{total}")
                 frame_visuals.append(
                     FrameVisual(
                         timestamp=ts,
@@ -116,7 +137,9 @@ class Pipeline:
                 )
 
         if bundle.image_paths:
+            total = len(bundle.image_paths)
             for i, p in enumerate(bundle.image_paths):
+                progress_cb(JobStatus.extracting, f"image {i + 1}/{total}")
                 image_visuals.append(
                     ImageVisual(
                         index=i,
@@ -127,6 +150,7 @@ class Pipeline:
 
         understanding: dict = {}
         if self.understander is not None:
+            progress_cb(JobStatus.understanding, "summarizing")
             try:
                 understanding = (
                     self.understander.understand(transcript, frame_visuals, image_visuals) or {}
@@ -134,6 +158,8 @@ class Pipeline:
             except Exception:
                 log.exception("understander failed; rendering without it")
                 understanding = {}
+
+        progress_cb(JobStatus.rendering, "writing markdown")
 
         inputs = LessonInputs(
             source_url=url,

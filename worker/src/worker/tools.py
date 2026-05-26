@@ -222,35 +222,31 @@ class DouyinFetcher(Fetcher):
 
     @staticmethod
     def _parse_image_urls(html: str) -> list[str]:
-        """Walk every slide ({"uri":"...","url_list":[...]}) that follows
-        an "images":[ marker, take the first https URL per slide, dedupe.
+        """Walk every slide ({"uri":"...","url_list":[...]}) under "images":[.
+
+        Different size variants of the same image share the same `uri` field
+        but differ in URL — we dedupe on `uri` so we only download each slide
+        once, and pick the largest-looking URL (first in the url_list).
         """
+        seen_uris: set[str] = set()
         urls: list[str] = []
         for m in re.finditer(r'"images":\[', html):
             tail = html[m.end():]
-            # Walk each {"uri":"...","url_list":[...]} object until the array closes.
             for slide_m in re.finditer(
-                r'\{"uri":"[^"]*","url_list":\[(.*?)\]',
+                r'\{"uri":"([^"]*)","url_list":\[(.*?)\]',
                 tail,
                 re.DOTALL,
             ):
-                url_blob = slide_m.group(1)
-                # Stop once we leave this images array.
-                # Rough guard: if we've already walked >5KB into the tail it's
-                # almost certainly past this images block.
                 if slide_m.start() > 20_000:
                     break
-                u_m = re.search(r'"(https[^"]+)"', url_blob)
+                uri = slide_m.group(1)
+                if uri in seen_uris:
+                    continue
+                u_m = re.search(r'"(https[^"]+)"', slide_m.group(2))
                 if u_m:
+                    seen_uris.add(uri)
                     urls.append(json.loads('"' + u_m.group(1) + '"'))
-        # Dedupe while preserving order.
-        seen = set()
-        deduped: list[str] = []
-        for u in urls:
-            if u not in seen:
-                seen.add(u)
-                deduped.append(u)
-        return deduped
+        return urls
 
 
 class YtDlpFetcher(Fetcher):
@@ -542,7 +538,9 @@ class OllamaVisionAnalyzer(VisionAnalyzer):
             return ""
         try:
             payload = base64.b64encode(image_path.read_bytes()).decode("ascii")
-            with httpx.Client(timeout=300.0) as c:
+            # 10 min timeout — first-call cold-start on qwen2.5vl can be 1-2 min,
+            # then ~30s per image steady-state. Be generous.
+            with httpx.Client(timeout=600.0) as c:
                 r = c.post(
                     f"{self.base_url}/api/generate",
                     json={

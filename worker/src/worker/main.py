@@ -30,16 +30,44 @@ async def process_one(client: DispatcherClient, pipeline: Pipeline, config: Conf
 
     try:
         await client.post_progress(job.id, JobStatus.fetching, "downloading")
-        # The pipeline runs synchronously; we offload to a thread so we don't block the loop.
-        markdown, title, slug = await asyncio.to_thread(
-            _run_pipeline_with_progress,
-            pipeline,
-            job.url or "",
-            job_dir,
-            config.frame_every_seconds,
-            client,
-            job.id,
-        )
+
+        # The pipeline runs synchronously; we offload to a thread so we don't block
+        # the loop. We can't easily ping progress mid-pipeline without restructuring,
+        # so we kick off a background pinger that periodically taps the dispatcher
+        # with the last-known stage.
+        progress_state = {"status": JobStatus.fetching, "message": "downloading"}
+
+        async def pinger():
+            while True:
+                await asyncio.sleep(15)
+                try:
+                    await client.post_progress(
+                        job.id, progress_state["status"], progress_state["message"]
+                    )
+                except Exception:
+                    pass
+
+        pinger_task = asyncio.create_task(pinger())
+
+        def progress_cb(status: JobStatus, message: str | None) -> None:
+            progress_state["status"] = status
+            progress_state["message"] = message or ""
+
+        try:
+            markdown, title, slug = await asyncio.to_thread(
+                _run_pipeline_with_progress,
+                pipeline,
+                job.url or "",
+                job_dir,
+                config.frame_every_seconds,
+                progress_cb,
+            )
+        finally:
+            pinger_task.cancel()
+            try:
+                await pinger_task
+            except (asyncio.CancelledError, Exception):
+                pass
         await client.post_result(
             job.id,
             JobResult(
@@ -81,11 +109,15 @@ def _run_pipeline_with_progress(
     url: str,
     job_dir: Path,
     frame_every_seconds: int,
-    client: DispatcherClient,
-    job_id: str,
+    progress_cb,
 ) -> tuple[str, str, str]:
-    """Sync wrapper that owns the heavy lifting. Progress pings are best-effort."""
-    return pipeline.run(url=url, work_dir=job_dir, frame_every_seconds=frame_every_seconds)
+    """Sync wrapper that owns the heavy lifting."""
+    return pipeline.run(
+        url=url,
+        work_dir=job_dir,
+        frame_every_seconds=frame_every_seconds,
+        progress_cb=progress_cb,
+    )
 
 
 async def run_forever(config: Config) -> None:

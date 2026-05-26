@@ -1,11 +1,19 @@
-"""Concrete pipeline implementations using yt-dlp, ffmpeg, whisper.cpp, tesseract, ollama."""
+"""Concrete pipeline implementations.
+
+Stack:
+- yt-dlp / Douyin share-page scraper for fetch.
+- ffmpeg for audio extract.
+- Groq Whisper API for transcription.
+- Gemini Files API + Flash model for video understanding (replaces local
+  frame-sampling, OCR, vision LLM, and text summarization).
+"""
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import re
 import subprocess
+import time
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -15,28 +23,21 @@ from .pipeline import (
     AudioExtractor,
     FetchError,
     Fetcher,
-    FrameSampler,
     MediaBundle,
-    OcrCleaner,
-    OcrRunner,
     Transcriber,
-    Understander,
-    VisionAnalyzer,
+    VideoUnderstander,
 )
-from .render import FrameVisual, ImageVisual, TranscriptSegment
-from .text import format_ts
+from .render import TranscriptSegment
 
 log = logging.getLogger(__name__)
 
 
-# ---- Fetcher chain ----
+# ---------------------------------------------------------------------------
+# Fetcher chain — unchanged from prior versions.
+# ---------------------------------------------------------------------------
 
 class CompositeFetcher(Fetcher):
-    """Try fetchers in order. First one that doesn't raise FetchError wins.
-
-    A fetcher that doesn't recognize the URL should raise FetchError; the next
-    fetcher gets a turn. When the chain is exhausted, the last error is raised.
-    """
+    """Try fetchers in order; first that doesn't raise FetchError wins."""
 
     def __init__(self, fetchers: list[Fetcher]) -> None:
         if not fetchers:
@@ -64,18 +65,15 @@ _MOBILE_UA = (
 
 
 def _extract_douyin_id(url: str) -> str | None:
-    """Pull the numeric aweme_id from any supported Douyin URL form."""
     parsed = urlparse(url)
     if "douyin" not in parsed.netloc and "iesdouyin" not in parsed.netloc:
         return None
     m = _DOUYIN_VIDEO_ID.search(url)
     if m:
         return m.group(1)
-    # /jingxuan?modal_id=<id>
     qs = parse_qs(parsed.query)
     if "modal_id" in qs and qs["modal_id"][0].isdigit():
         return qs["modal_id"][0]
-    # /share/video/<id>/
     if "/share/video/" in parsed.path:
         tail = parsed.path.rstrip("/").rsplit("/", 1)[-1]
         if tail.isdigit():
@@ -84,11 +82,7 @@ def _extract_douyin_id(url: str) -> str | None:
 
 
 class DouyinFetcher(Fetcher):
-    """Pulls media info from the iesdouyin.com share page (no auth, no cookies).
-
-    Handles both video posts and image-carousel posts ("note" / aweme_type=2).
-    The share-page HTML embeds a JSON island; we parse the relevant fields directly.
-    """
+    """Pulls media info from iesdouyin.com share pages. No auth, no cookies."""
 
     SHARE = "https://www.iesdouyin.com/share/video/{id}/"
 
@@ -97,7 +91,7 @@ class DouyinFetcher(Fetcher):
         if not aweme_id:
             raise FetchError(
                 f"DouyinFetcher: not a Douyin URL: {url}",
-                "Worker chain skipped Douyin scraper because the URL didn't look like one.",
+                "Worker chain skipped Douyin scraper because URL didn't look like one.",
             )
         try:
             with httpx.Client(timeout=30.0, follow_redirects=True) as c:
@@ -114,7 +108,7 @@ class DouyinFetcher(Fetcher):
         if not info:
             raise FetchError(
                 "DouyinFetcher: share page didn't contain recognizable media",
-                "Douyin returned an unrecognized response. The post may be deleted, "
+                "Douyin returned an unrecognized response. Post may be deleted, "
                 "private, or the share-page format may have changed.",
             )
 
@@ -122,10 +116,8 @@ class DouyinFetcher(Fetcher):
         music_title = (info.get("music_title") or "").strip()
         author = (info.get("author") or "").strip()
 
-        # Title preference: post desc (first line, truncated) > author > music.
         title = self._title_from(post_text, author, music_title, aweme_id)
 
-        # Image-carousel post.
         if info.get("image_urls"):
             image_paths = self._download_images(info["image_urls"], aweme_id, work_dir)
             return MediaBundle(
@@ -136,7 +128,6 @@ class DouyinFetcher(Fetcher):
                 music_title=music_title,
             )
 
-        # Video post.
         if info.get("play_url"):
             video_path = self._download_video(info["play_url"], aweme_id, work_dir)
             return MediaBundle(
@@ -155,15 +146,8 @@ class DouyinFetcher(Fetcher):
 
     @staticmethod
     def _title_from(post_text: str, author: str, music_title: str, aweme_id: str) -> str:
-        """Pick the best human-meaningful title for the note.
-
-        Order: first-line of post text → music → author → fallback.
-        Strips Douyin's hashtag-spam tail (#tag1 #tag2 ...) so a 200-char post
-        doesn't drag a wall of tags into the filename.
-        """
         if post_text:
             first_line = post_text.splitlines()[0].strip()
-            # Drop trailing hashtag spam.
             first_line = re.sub(r"\s*#\S+(\s+#\S+)*\s*$", "", first_line).strip()
             if first_line:
                 return first_line[:80]
@@ -185,12 +169,12 @@ class DouyinFetcher(Fetcher):
         except httpx.HTTPError as e:
             raise FetchError(
                 f"DouyinFetcher: video download failed: {e}",
-                "Could resolve the Douyin video but the download failed. Try again later.",
+                "Could resolve the Douyin video but the download failed.",
             ) from e
         if media_path.stat().st_size < 1024:
             raise FetchError(
                 "DouyinFetcher: downloaded file is implausibly small",
-                "Got a tiny file from Douyin — likely an error page. Try again later.",
+                "Got a tiny file from Douyin — likely an error page.",
             )
         return media_path
 
@@ -207,7 +191,6 @@ class DouyinFetcher(Fetcher):
                 log.warning("image %d/%d failed; skipping", i + 1, len(urls))
                 continue
             if target.stat().st_size < 200:
-                log.warning("image %d/%d implausibly small; skipping", i + 1, len(urls))
                 continue
             out.append(target)
         if not out:
@@ -219,30 +202,16 @@ class DouyinFetcher(Fetcher):
 
     @staticmethod
     def _parse_share_html(html: str) -> dict | None:
-        """Extract the fields we care about from the share-page JSON island.
-
-        The HTML embeds JSON whose strings use \\uXXXX escapes for CJK; we
-        round-trip via json.loads on quoted-string fragments so codepoints
-        come out correctly.
-        """
-        # 1) Post description (the actual user-typed caption).
         desc = DouyinFetcher._unescape(
             re.search(r'"desc":\s*("(?:[^"\\]|\\.){1,2000}")', html)
         )
-
-        # 2) Author display name. The author block is a nested object; we look
-        #    for the *first* nickname field, which belongs to the post author
-        #    (later nicknames belong to commenters).
         author = DouyinFetcher._unescape(
             re.search(r'"author":\{[^}]{0,2000}?"nickname":\s*("(?:[^"\\]|\\.){1,200}")', html)
         )
-
-        # 3) Music / BGM title — what we used to mistakenly call the post title.
         music_title = DouyinFetcher._unescape(
             re.search(r'"music":\{[^}]{0,2000}?"title":\s*("(?:[^"\\]|\\.){1,400}")', html)
         )
 
-        # Detect image-carousel posts (aweme_type=2).
         aweme_type_m = re.search(r'"aweme_type":(\d+)', html)
         is_images = bool(aweme_type_m) and aweme_type_m.group(1) == "2"
 
@@ -253,7 +222,6 @@ class DouyinFetcher(Fetcher):
             if image_urls:
                 out["image_urls"] = image_urls
                 return out
-            # Fall through — some aweme_type=2 posts still have a video.
 
         dur_m = re.search(r'"duration":(\d+)', html)
         duration = int(dur_m.group(1)) / 1000.0 if dur_m else 0.0
@@ -273,24 +241,7 @@ class DouyinFetcher(Fetcher):
         return None if not desc else out
 
     @staticmethod
-    def _unescape(m: re.Match | None) -> str:
-        """Helper: take an re.Match whose group(1) is a JSON-quoted string and
-        return the raw Python string. Returns "" for None or parse failures."""
-        if not m:
-            return ""
-        try:
-            return json.loads(m.group(1))
-        except (ValueError, json.JSONDecodeError):
-            return ""
-
-    @staticmethod
     def _parse_image_urls(html: str) -> list[str]:
-        """Walk every slide ({"uri":"...","url_list":[...]}) under "images":[.
-
-        Different size variants of the same image share the same `uri` field
-        but differ in URL — we dedupe on `uri` so we only download each slide
-        once, and pick the largest-looking URL (first in the url_list).
-        """
         seen_uris: set[str] = set()
         urls: list[str] = []
         for m in re.finditer(r'"images":\[', html):
@@ -311,12 +262,21 @@ class DouyinFetcher(Fetcher):
                     urls.append(json.loads('"' + u_m.group(1) + '"'))
         return urls
 
+    @staticmethod
+    def _unescape(m: re.Match | None) -> str:
+        if not m:
+            return ""
+        try:
+            return json.loads(m.group(1))
+        except (ValueError, json.JSONDecodeError):
+            return ""
+
 
 class YtDlpFetcher(Fetcher):
-    """Uses the yt-dlp Python library. Video posts only — no carousel support."""
+    """yt-dlp for non-Douyin URLs."""
 
     def fetch(self, url: str, work_dir: Path) -> MediaBundle:
-        from yt_dlp import YoutubeDL  # lazy: keep import optional for tests
+        from yt_dlp import YoutubeDL
         from yt_dlp.utils import DownloadError
 
         out_template = str(work_dir / "%(id)s.%(ext)s")
@@ -335,7 +295,7 @@ class YtDlpFetcher(Fetcher):
             guidance = self._guidance_for(url, msg)
             raise FetchError(msg, guidance) from e
 
-        media_path = Path(ydl.prepare_filename(info))  # type: ignore[arg-type]
+        media_path = Path(ydl.prepare_filename(info))
         if not media_path.exists():
             raise FetchError("yt-dlp finished but file missing", "Try uploading the file manually.")
         return MediaBundle(
@@ -349,29 +309,21 @@ class YtDlpFetcher(Fetcher):
         if "douyin" in url or "iesdouyin" in url:
             return (
                 "Couldn't fetch the Douyin video automatically. "
-                "Open it in your phone, save the video, AirDrop it to your Mac, "
-                "and use 'Pitch: Upload Local File' in Obsidian."
+                "Save the video on your phone and AirDrop to your Mac."
             )
-        return f"Couldn't fetch the video: {err[:200]}. Try uploading the file manually."
+        return f"Couldn't fetch the video: {err[:200]}."
 
 
-# ---- Audio ----
+# ---------------------------------------------------------------------------
+# Audio
+# ---------------------------------------------------------------------------
 
 class FfmpegAudioExtractor(AudioExtractor):
     def extract(self, video_path: Path, work_dir: Path) -> Path:
         out = work_dir / f"{video_path.stem}.16k.wav"
         cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(video_path),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-f",
-            "wav",
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vn", "-ac", "1", "-ar", "16000", "-f", "wav",
             str(out),
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -380,378 +332,241 @@ class FfmpegAudioExtractor(AudioExtractor):
         return out
 
 
-# ---- Transcribe ----
+# ---------------------------------------------------------------------------
+# Transcription via Groq Whisper API
+# ---------------------------------------------------------------------------
 
-class WhisperCppTranscriber(Transcriber):
-    """Calls the `whisper-cli` binary from whisper.cpp.
+class GroqTranscriber(Transcriber):
+    """Calls Groq's hosted Whisper. ~200x faster than local whisper.cpp.
 
-    Whisper.cpp's CLI emits JSON when given `--output-json`. We parse segments.
+    Free tier: rate-limited but generous (currently ~7,200 audio-seconds/min).
+    Returns the same TranscriptSegment shape as the local transcriber so the
+    rest of the pipeline doesn't care.
     """
 
-    def __init__(self, whisper_bin: str, model_path: str) -> None:
-        self.whisper_bin = whisper_bin
-        self.model_path = model_path
+    URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+    MODEL = "whisper-large-v3-turbo"
+
+    def __init__(self, api_key: str) -> None:
+        if not api_key:
+            raise ValueError("GroqTranscriber requires a non-empty API key")
+        self.api_key = api_key
 
     def transcribe(self, audio_path: Path) -> list[TranscriptSegment]:
-        out_prefix = audio_path.with_suffix("")
-        cmd = [
-            self.whisper_bin,
-            "-m",
-            self.model_path,
-            "-f",
-            str(audio_path),
-            "-l",
-            "auto",
-            "-oj",
-            "-of",
-            str(out_prefix),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise RuntimeError(f"whisper failed: {proc.stderr[-500:]}")
-        json_path = Path(str(out_prefix) + ".json")
-        if not json_path.exists():
-            raise RuntimeError("whisper produced no JSON output")
-        data = json.loads(json_path.read_text())
-        # whisper.cpp JSON: {"transcription": [{"offsets": {"from": ms, "to": ms}, "text": "..."}, ...]}
+        files = {
+            "file": (audio_path.name, audio_path.read_bytes(), "audio/wav"),
+        }
+        data = {
+            "model": self.MODEL,
+            "response_format": "verbose_json",
+            "timestamp_granularities[]": "segment",
+        }
+        with httpx.Client(timeout=300.0) as c:
+            r = c.post(
+                self.URL,
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                files=files,
+                data=data,
+            )
+        r.raise_for_status()
+        body = r.json()
+
+        segments_raw = body.get("segments") or []
         out: list[TranscriptSegment] = []
-        for seg in data.get("transcription", []):
-            ts = seg.get("offsets") or {}
-            start = float(ts.get("from", 0)) / 1000.0
-            end = float(ts.get("to", 0)) / 1000.0
+        for seg in segments_raw:
             text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+            out.append(
+                TranscriptSegment(
+                    start=float(seg.get("start") or 0.0),
+                    end=float(seg.get("end") or 0.0),
+                    text=text,
+                )
+            )
+        # Fallback if Groq returns plain text only (rare).
+        if not out:
+            text = (body.get("text") or "").strip()
             if text:
-                out.append(TranscriptSegment(start=start, end=end, text=text))
+                out.append(TranscriptSegment(start=0.0, end=0.0, text=text))
         return out
 
 
-# ---- Frame sampling ----
+# ---------------------------------------------------------------------------
+# Video understanding via Gemini Files API
+# ---------------------------------------------------------------------------
 
-class FfmpegFrameSampler(FrameSampler):
-    def sample(self, video_path: Path, work_dir: Path, every_seconds: int) -> list[tuple[float, Path]]:
-        frames_dir = work_dir / "frames"
-        frames_dir.mkdir(exist_ok=True)
-        # Use fps=1/every_seconds. Output: frame-001.jpg, frame-002.jpg, ...
-        out_pattern = frames_dir / "frame-%04d.jpg"
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(video_path),
-            "-vf",
-            f"fps=1/{every_seconds}",
-            "-q:v",
-            "3",
-            str(out_pattern),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise RuntimeError(f"ffmpeg frame sample failed: {proc.stderr[-500:]}")
-        result: list[tuple[float, Path]] = []
-        for i, p in enumerate(sorted(frames_dir.glob("frame-*.jpg"))):
-            result.append((float(i * every_seconds), p))
-        return result
+class GeminiVideoUnderstander(VideoUnderstander):
+    """Uploads a video to Gemini's Files API and asks for structured output.
 
+    Why this replaces our previous frame-sampling pipeline:
+      Gemini ingests the video natively, gets temporal context, and produces
+      a coverage paragraph + key points + tools + code in one round trip.
+      No local frame extraction, no OCR, no per-frame vision calls.
 
-# ---- OCR ----
+    Free tier: generous. Files live for 48 hours then expire.
+    """
 
-class TesseractOcrRunner(OcrRunner):
-    def __init__(self, langs: str = "eng+chi_sim") -> None:
-        self.langs = langs
+    UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+    MODEL_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    DEFAULT_MODEL = "gemini-2.5-flash"
 
-    def run(self, image_path: Path) -> str:
-        proc = subprocess.run(
-            ["tesseract", str(image_path), "-", "-l", self.langs],
-            capture_output=True,
-            text=True,
-        )
-        if proc.returncode != 0:
-            log.warning("tesseract failed on %s: %s", image_path, proc.stderr[-200:])
-            return ""
-        return self._clean(proc.stdout)
-
-    @staticmethod
-    def _clean(text: str) -> str:
-        # Drop very short lines (likely garbage). Keep code-ish lines.
-        lines = [ln.rstrip() for ln in text.splitlines()]
-        kept = [ln for ln in lines if len(ln.strip()) >= 2]
-        return "\n".join(kept).strip()
-
-
-# ---- Understanding (optional, local Ollama) ----
-
-OLLAMA_PROMPT = """\
-You are summarizing a video into a single coverage paragraph for a developer's
-knowledge base. The user will read your output to decide whether to watch the
-full video.
-
-You will receive (any may be empty):
-  - POST TEXT: the creator's caption.
-  - AUTHOR: post creator's name.
-  - TRANSCRIPT: spoken audio.
-  - FRAME VISUALS: vision-LLM descriptions of key on-screen moments.
-  - OCR: text recognized inside frames (noisy).
-
-Output VALID JSON only. No prose, no markdown fences. Match the source's
-language (Chinese → Chinese, English → English).
-
-Schema:
-{
-  "coverage": "<one paragraph (3-6 sentences) describing what this video covers — topics, claims, demonstrations, conclusions. Concrete, not promotional.>",
-  "key_points": ["<short actionable bullet>", ...],
-  "tools_mentioned": ["<tool/product name>", ...],
-  "code_snippets": ["<short exact code or command shown on screen>", ...]
-}
-
-Rules:
-  - The "coverage" should answer: 'what does this video cover?' as if briefing a peer.
-  - Empty arrays are fine when nothing applies.
-  - Do NOT include BGM track names as tools.
-  - Always return all four keys.
-
-"""
-
-
-class OllamaUnderstander(Understander):
-    def __init__(self, base_url: str, model: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.model = model
+    def __init__(self, api_key: str, model: str | None = None) -> None:
+        if not api_key:
+            raise ValueError("GeminiVideoUnderstander requires a non-empty API key")
+        self.api_key = api_key
+        self.model = model or self.DEFAULT_MODEL
 
     def understand(
         self,
+        video_path: Path,
         transcript: list[TranscriptSegment],
-        frame_visuals: list[FrameVisual],
-        image_visuals: list[ImageVisual],
         post_text: str = "",
         author: str = "",
     ) -> dict:
-        transcript_text = "\n".join(seg.text for seg in transcript)[:10000]
-        frame_text = "\n\n".join(self._frame_block(f) for f in frame_visuals)[:6000]
-        image_text = "\n\n".join(self._image_block(i) for i in image_visuals)[:6000]
+        file_uri, mime_type = self._upload_and_wait(video_path)
+        prompt = self._build_prompt(transcript, post_text, author)
 
-        prompt_parts = [OLLAMA_PROMPT]
-        if post_text:
-            prompt_parts.append("POST TEXT:\n" + post_text[:2000])
-        if author:
-            prompt_parts.append("AUTHOR: " + author)
-        if transcript_text:
-            prompt_parts.append("TRANSCRIPT:\n" + transcript_text)
-        if image_text:
-            prompt_parts.append("CAROUSEL IMAGES:\n" + image_text)
-        if frame_text:
-            prompt_parts.append("FRAME VISUALS:\n" + frame_text)
-        prompt = "\n\n".join(prompt_parts)
+        url = self.MODEL_URL.format(model=self.model) + f"?key={self.api_key}"
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"file_data": {"mime_type": mime_type, "file_uri": file_uri}},
+                        {"text": prompt},
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "coverage": {"type": "STRING"},
+                        "key_points": {"type": "ARRAY", "items": {"type": "STRING"}},
+                        "tools_mentioned": {"type": "ARRAY", "items": {"type": "STRING"}},
+                        "code_snippets": {"type": "ARRAY", "items": {"type": "STRING"}},
+                    },
+                    "required": ["coverage", "key_points", "tools_mentioned", "code_snippets"],
+                },
+            },
+        }
+        with httpx.Client(timeout=600.0) as c:
+            r = c.post(url, json=payload)
+        r.raise_for_status()
+        body = r.json()
 
         try:
-            with httpx.Client(timeout=300.0) as c:
-                r = c.post(
-                    f"{self.base_url}/api/generate",
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "format": "json",
-                        "keep_alive": "30m",
-                    },
-                )
-            r.raise_for_status()
-            body = r.json()
-            return self._parse(body.get("response", "{}"))
-        except Exception as e:
-            log.warning("ollama understand failed: %s", e)
+            text = body["candidates"][0]["content"]["parts"][0]["text"]
+            return json.loads(text)
+        except (KeyError, IndexError, json.JSONDecodeError) as e:
+            log.warning("Gemini returned unparseable response: %s", e)
             return {}
 
-    @staticmethod
-    def _frame_block(f: FrameVisual) -> str:
-        ts = format_ts(f.timestamp)
-        parts = [f"[{ts}]"]
-        if f.vision_description:
-            parts.append("vision: " + f.vision_description)
-        if f.ocr_text:
-            parts.append("ocr: " + f.ocr_text)
-        return " ".join(parts)
+    # ----- Files API helpers -----
 
-    @staticmethod
-    def _image_block(i: ImageVisual) -> str:
-        parts = [f"[image {i.index + 1}]"]
-        if i.vision_description:
-            parts.append("vision: " + i.vision_description)
-        if i.ocr_text:
-            parts.append("ocr: " + i.ocr_text)
-        return " ".join(parts)
+    def _upload_and_wait(self, video_path: Path) -> tuple[str, str]:
+        """Upload the video, wait for it to leave PROCESSING state, return
+        (file_uri, mime_type) ready to reference in a generateContent call."""
+        size = video_path.stat().st_size
+        mime_type = "video/mp4"
 
-    @staticmethod
-    def _parse(raw: str) -> dict:
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            m = re.search(r"\{.*\}", raw, re.DOTALL)
-            if m:
-                try:
-                    return json.loads(m.group(0))
-                except json.JSONDecodeError:
-                    return {}
-            return {}
-
-
-# ---- Vision (multimodal local LLM) ----
-
-class OllamaVisionAnalyzer(VisionAnalyzer):
-    """Describe an image's visual content via a local multimodal model.
-
-    Uses Ollama's /api/generate with `images: [base64]`. The default prompt
-    is tuned for vibe-coding posts — diagrams, screenshots, code, slides — but
-    works fine on general scenes too.
-    """
-
-    DEFAULT_PROMPT = (
-        "Describe what is shown in this image in 1-2 sentences. "
-        "If you can read text, code, or commands, transcribe them verbatim. "
-        "If it's a diagram, describe the structure. Be concrete, no fluff."
-    )
-
-    # Long edge passed to the vision model. Larger ⇒ more detail but slower.
-    # 1024 keeps fine-grained text legible while cutting inference cost ~75%
-    # vs typical Douyin source images (1860×2475).
-    MAX_LONG_EDGE = 1024
-
-    # Tell Ollama to keep the model resident this long after a call. Eliminates
-    # cold-start on the next image / next job.
-    KEEP_ALIVE = "30m"
-
-    def __init__(self, base_url: str, model: str, prompt: str | None = None) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.prompt = prompt or self.DEFAULT_PROMPT
-
-    def describe(self, image_path: Path) -> str:
-        if not image_path.exists():
-            return ""
-        try:
-            payload = self._encode_resized(image_path)
-            # 10 min timeout — covers cold-start on first call. Steady-state
-            # is ~10-20s per image once the model is warm.
-            with httpx.Client(timeout=600.0) as c:
-                r = c.post(
-                    f"{self.base_url}/api/generate",
-                    json={
-                        "model": self.model,
-                        "prompt": self.prompt,
-                        "images": [payload],
-                        "stream": False,
-                        "keep_alive": self.KEEP_ALIVE,
-                    },
-                )
-            r.raise_for_status()
-            body = r.json()
-            return (body.get("response") or "").strip()
-        except Exception as e:
-            log.warning("vision describe failed for %s: %s", image_path.name, e)
-            return ""
-
-    def _encode_resized(self, image_path: Path) -> str:
-        """Resize the image so its long edge is MAX_LONG_EDGE, re-encode as JPEG.
-
-        Reasons:
-          1. Faster vision inference — far fewer tokens for the model to process.
-          2. Ollama's vision endpoint takes JPEG/PNG; some Douyin images are .webp
-             with broken metadata that can confuse the model. Re-encoding
-             normalizes everything to safe JPEG.
-        """
-        try:
-            from PIL import Image
-        except ImportError:
-            # Fallback: send raw bytes if Pillow isn't installed.
-            return base64.b64encode(image_path.read_bytes()).decode("ascii")
-        from io import BytesIO
-
-        img = Image.open(image_path)
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        long_edge = max(img.size)
-        if long_edge > self.MAX_LONG_EDGE:
-            scale = self.MAX_LONG_EDGE / long_edge
-            new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
-            img = img.resize(new_size, Image.LANCZOS)
-        buf = BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        return base64.b64encode(buf.getvalue()).decode("ascii")
-
-
-# ---- OCR cleanup (text-only LLM pass) ----
-
-OCR_CLEAN_PROMPT = """\
-You are fixing garbled OCR text from a screenshot. Rules:
-  - Preserve every character that looks intentional.
-  - Remove spurious spaces inside Chinese/Japanese/Korean words and numbers.
-  - Fix obvious OCR confusions (e.g. "Al" vs "AI", "0" vs "O") only when the
-    surrounding context makes the correct reading obvious.
-  - Preserve line breaks, lists, code blocks, and punctuation as-is.
-  - Do NOT translate. Do NOT summarize. Do NOT add commentary.
-  - Output ONLY the cleaned text. No prose. No markdown fences.
-
-Vision context (what the image actually shows): {vision_hint}
-
-Garbled OCR:
----
-{raw_ocr}
----
-
-Cleaned:"""
-
-
-class OllamaOcrCleaner(OcrCleaner):
-    def __init__(self, base_url: str, model: str) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-
-    def clean(self, raw_ocr: str, vision_hint: str = "") -> str:
-        if len(raw_ocr.strip()) < 4:
-            return raw_ocr
-        prompt = OCR_CLEAN_PROMPT.format(
-            vision_hint=vision_hint or "(none)",
-            raw_ocr=raw_ocr[:4000],
+        # Step 1: start a resumable upload session.
+        start_url = self.UPLOAD_URL + f"?key={self.api_key}"
+        with httpx.Client(timeout=60.0) as c:
+            init = c.post(
+                start_url,
+                headers={
+                    "X-Goog-Upload-Protocol": "resumable",
+                    "X-Goog-Upload-Command": "start",
+                    "X-Goog-Upload-Header-Content-Length": str(size),
+                    "X-Goog-Upload-Header-Content-Type": mime_type,
+                    "Content-Type": "application/json",
+                },
+                json={"file": {"display_name": video_path.name}},
+            )
+        init.raise_for_status()
+        upload_url = init.headers.get("X-Goog-Upload-URL") or init.headers.get(
+            "x-goog-upload-url"
         )
-        try:
-            with httpx.Client(timeout=180.0) as c:
-                r = c.post(
-                    f"{self.base_url}/api/generate",
-                    json={
-                        "model": self.model,
-                        "prompt": prompt,
-                        "stream": False,
-                        "keep_alive": "30m",
-                    },
-                )
-            r.raise_for_status()
-            body = r.json()
-            cleaned = (body.get("response") or "").strip()
-            # Strip the model's tendency to wrap in code fences or repeat the
-            # "Cleaned:" header even when told not to.
-            cleaned = re.sub(r"^```[a-z]*\n?", "", cleaned, count=1)
-            cleaned = re.sub(r"\n?```\s*$", "", cleaned, count=1)
-            cleaned = re.sub(r"^Cleaned:\s*", "", cleaned, count=1)
-            return cleaned.strip() or raw_ocr
-        except Exception as e:
-            log.warning("ocr cleaner failed: %s", e)
-            return raw_ocr
+        if not upload_url:
+            raise RuntimeError("Gemini upload init returned no upload URL")
 
+        # Step 2: upload the bytes in one shot.
+        with httpx.Client(timeout=600.0) as c:
+            up = c.post(
+                upload_url,
+                headers={
+                    "Content-Length": str(size),
+                    "X-Goog-Upload-Offset": "0",
+                    "X-Goog-Upload-Command": "upload, finalize",
+                },
+                content=video_path.read_bytes(),
+            )
+        up.raise_for_status()
+        meta = up.json().get("file") or {}
+        file_uri = meta.get("uri")
+        file_name = meta.get("name")
+        state = meta.get("state")
+        if not file_uri or not file_name:
+            raise RuntimeError(f"Gemini upload returned no uri/name: {up.text[:300]}")
+
+        # Step 3: poll until ACTIVE (videos go through PROCESSING first).
+        poll_url = f"https://generativelanguage.googleapis.com/v1beta/{file_name}?key={self.api_key}"
+        deadline = time.monotonic() + 180
+        while state == "PROCESSING":
+            if time.monotonic() > deadline:
+                raise RuntimeError("Gemini file stayed in PROCESSING for >3 min")
+            time.sleep(2)
+            with httpx.Client(timeout=30.0) as c:
+                p = c.get(poll_url)
+            p.raise_for_status()
+            file_meta = p.json()
+            state = file_meta.get("state")
+        if state != "ACTIVE":
+            raise RuntimeError(f"Gemini file ended in state={state}")
+        return file_uri, mime_type
+
+    @staticmethod
+    def _build_prompt(
+        transcript: list[TranscriptSegment], post_text: str, author: str
+    ) -> str:
+        transcript_text = "\n".join(f"[{seg.start:.0f}s] {seg.text}" for seg in transcript)[:8000]
+        parts = [
+            "You are summarizing a short tech / vibe-coding video for a "
+            "developer's knowledge base. The user will read your output to "
+            "decide whether to watch the full video.",
+            "",
+            "Output JSON only. Match the source's language (Chinese in → Chinese out).",
+            "",
+            "Fields:",
+            "- coverage: one paragraph (3-6 sentences) describing what this "
+            "video covers. Concrete topics, claims, demonstrations.",
+            "- key_points: actionable bullets, max ~15 words each.",
+            "- tools_mentioned: tool/product names shown or named.",
+            "- code_snippets: short exact code or commands shown on screen.",
+            "",
+            "Empty arrays are fine when nothing applies.",
+        ]
+        if post_text:
+            parts.append("\nPOST TEXT (creator's caption):\n" + post_text[:2000])
+        if author:
+            parts.append("\nAUTHOR: " + author)
+        if transcript_text:
+            parts.append("\nTRANSCRIPT (timestamps in seconds):\n" + transcript_text)
+        return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Default pipeline factory
+# ---------------------------------------------------------------------------
 
 def make_default_pipeline(config):  # noqa: ANN001
     from .pipeline import Pipeline
 
-    vision_model = getattr(config, "vision_model", "") or ""
-    vision = (
-        OllamaVisionAnalyzer(config.ollama_url, vision_model) if vision_model else None
-    )
-    text_model = config.ollama_model
     return Pipeline(
         fetcher=CompositeFetcher([DouyinFetcher(), YtDlpFetcher()]),
         audio=FfmpegAudioExtractor(),
-        transcriber=WhisperCppTranscriber(config.whisper_bin, config.whisper_model),
-        frames=FfmpegFrameSampler(),
-        ocr=TesseractOcrRunner(),
-        vision=vision,
-        understander=OllamaUnderstander(config.ollama_url, text_model),
-        ocr_cleaner=OllamaOcrCleaner(config.ollama_url, text_model),
+        transcriber=GroqTranscriber(config.groq_api_key),
+        understander=GeminiVideoUnderstander(config.gemini_api_key),
     )

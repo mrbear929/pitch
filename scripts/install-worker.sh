@@ -6,67 +6,49 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
 WORKER_DIR="$HERE/worker"
 APP_SUPPORT="$HOME/Library/Application Support/Pitch"
-MODELS_DIR="$APP_SUPPORT/models"
+APP_VENV="$APP_SUPPORT/.venv"
+APP_SRC="$APP_SUPPORT/src"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.mrbear929.pitch-worker.plist"
 LOG_DIR="$APP_SUPPORT/logs"
 ENV_FILE="$APP_SUPPORT/worker.env"
 
-mkdir -p "$APP_SUPPORT" "$MODELS_DIR" "$LOG_DIR"
+mkdir -p "$APP_SUPPORT" "$LOG_DIR"
 
-echo "==> Checking Homebrew dependencies"
-need=()
-for tool in ffmpeg tesseract whisper-cpp ollama; do
-  if ! command -v "$tool" >/dev/null 2>&1 && ! ls /opt/homebrew/bin/"$tool" >/dev/null 2>&1; then
-    need+=("$tool")
-  fi
-done
-if [ ${#need[@]} -gt 0 ]; then
-  echo "Installing: ${need[*]}"
-  brew install "${need[@]}"
-fi
-# Tesseract Chinese pack
-if ! tesseract --list-langs 2>&1 | grep -q chi_sim; then
-  brew install tesseract-lang
+echo "==> Checking ffmpeg (only local binary still required)"
+if ! command -v ffmpeg >/dev/null 2>&1 && ! ls /opt/homebrew/bin/ffmpeg >/dev/null 2>&1; then
+  brew install ffmpeg
 fi
 
-echo "==> Pulling Ollama model qwen2.5:7b (skips if present)"
-if ! ollama list | awk '{print $1}' | grep -q '^qwen2.5:7b$'; then
-  ollama pull qwen2.5:7b
-fi
-
-echo "==> Downloading whisper.cpp medium model"
-MODEL_FILE="$MODELS_DIR/ggml-medium.bin"
-if [ ! -f "$MODEL_FILE" ]; then
-  curl -L -o "$MODEL_FILE" \
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin"
-fi
+echo "==> Copying source out of ~/Documents (macOS TCC blocks LaunchAgents from reading there)"
+rm -rf "$APP_SRC"
+mkdir -p "$APP_SRC"
+cp -R "$HERE/shared" "$APP_SRC/"
+cp -R "$HERE/server" "$APP_SRC/"
+cp -R "$HERE/worker" "$APP_SRC/"
+rm -rf "$APP_SRC/server/.venv" "$APP_SRC/worker/.venv"
 
 echo "==> Setting up worker venv"
-cd "$WORKER_DIR"
-[ -d .venv ] || python3 -m venv .venv
-.venv/bin/pip install --upgrade pip --quiet
-.venv/bin/pip install -e ../shared --quiet
-.venv/bin/pip install -e ../server --quiet
-.venv/bin/pip install -e . --quiet
+[ -d "$APP_VENV" ] || python3 -m venv "$APP_VENV"
+"$APP_VENV/bin/pip" install --upgrade pip --quiet
+"$APP_VENV/bin/pip" install -e "$APP_SRC/shared" --quiet
+"$APP_VENV/bin/pip" install -e "$APP_SRC/server" --quiet
+"$APP_VENV/bin/pip" install -e "$APP_SRC/worker" --quiet
 
-echo "==> Writing worker env (you must fill in dispatcher URL and worker token below)"
+echo "==> Writing worker env (fill in API keys before loading)"
 if [ ! -f "$ENV_FILE" ]; then
-  WBIN=$(which whisper-cli || echo /opt/homebrew/bin/whisper-cli)
   cat > "$ENV_FILE" <<EOF
 # Pitch worker environment.
-# Fill in PITCH_WORKER_TOKEN, then: launchctl unload + launchctl load -w to apply.
-# Values containing spaces MUST be quoted.
+# Get your free keys here:
+#   Groq:   https://console.groq.com/keys
+#   Gemini: https://aistudio.google.com/apikey
 PITCH_DISPATCHER_URL="https://tools.mrbear929.com/pitch"
 PITCH_WORKER_TOKEN=""
-PITCH_WHISPER_BIN="$WBIN"
-PITCH_WHISPER_MODEL="$MODEL_FILE"
-PITCH_OLLAMA_URL="http://127.0.0.1:11434"
-PITCH_OLLAMA_MODEL="qwen2.5:7b"
-PITCH_FRAME_EVERY_SECONDS="30"
+PITCH_GROQ_API_KEY=""
+PITCH_GEMINI_API_KEY=""
 PITCH_WORK_DIR="$APP_SUPPORT/work"
 EOF
   chmod 600 "$ENV_FILE"
-  echo "Wrote $ENV_FILE — fill in PITCH_WORKER_TOKEN before loading the agent."
+  echo "Wrote $ENV_FILE — fill in PITCH_WORKER_TOKEN, PITCH_GROQ_API_KEY, PITCH_GEMINI_API_KEY before loading."
 fi
 
 echo "==> Writing wrapper that sources env then execs the worker"
@@ -93,7 +75,7 @@ cat > "$PLIST_PATH" <<EOF
   <key>ProgramArguments</key>
   <array>
     <string>$WRAPPER</string>
-    <string>$WORKER_DIR/.venv/bin/pitch-worker</string>
+    <string>$APP_VENV/bin/pitch-worker</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -103,16 +85,21 @@ cat > "$PLIST_PATH" <<EOF
   </dict>
   <key>StandardOutPath</key><string>$LOG_DIR/worker.out.log</string>
   <key>StandardErrorPath</key><string>$LOG_DIR/worker.err.log</string>
-  <key>WorkingDirectory</key><string>$WORKER_DIR</string>
+  <key>WorkingDirectory</key><string>$APP_SRC/worker</string>
 </dict>
 </plist>
 EOF
 
 echo
 echo "Setup complete."
-echo "1. Edit $ENV_FILE and fill in PITCH_WORKER_TOKEN (printed by the EC2 deploy step)."
+echo "1. Edit $ENV_FILE and fill in PITCH_WORKER_TOKEN, PITCH_GROQ_API_KEY, PITCH_GEMINI_API_KEY."
 echo "2. Load the agent:"
 echo "     launchctl unload $PLIST_PATH 2>/dev/null || true"
 echo "     launchctl load -w $PLIST_PATH"
 echo "3. Tail logs:"
 echo "     tail -f \"$LOG_DIR/worker.err.log\""
+echo
+echo "Optional cleanup of old local-LLM models (no longer used):"
+echo "  brew uninstall whisper-cpp tesseract tesseract-lang ollama  # binaries"
+echo "  rm \"$APP_SUPPORT/models/ggml-medium.bin\"                  # whisper model (~1.5 GB)"
+echo "  ollama rm qwen2.5:7b qwen2.5vl:7b                          # ollama models (~10 GB)"
